@@ -21,6 +21,7 @@ public class ClientChannelContext {
     private volatile String username;
     private volatile String sessionToken;
     private volatile String currentRoom;
+    private volatile String role;
     private volatile boolean authenticated = false;
 
     public ClientChannelContext(SocketChannel channel) {
@@ -28,6 +29,7 @@ public class ClientChannelContext {
         this.readBuffer = ByteBuffer.allocate(NetworkConfig.NIO_BUFFER_CAPACITY);
         this.outboundQueue = new ConcurrentLinkedQueue<>();
         this.currentRoom = ProtocolConstants.DEFAULT_ROOMS[0];
+        this.role = ProtocolConstants.ROLE_STUDENT;
     }
 
     public SocketChannel getChannel() {
@@ -72,6 +74,18 @@ public class ClientChannelContext {
 
     public void setAuthenticated(boolean authenticated) {
         this.authenticated = authenticated;
+    }
+
+    public String getRole() {
+        return role;
+    }
+
+    public void setRole(String role) {
+        this.role = role != null ? role : ProtocolConstants.ROLE_STUDENT;
+    }
+
+    public boolean isModerator() {
+        return ProtocolConstants.ROLE_MODERATOR.equalsIgnoreCase(role);
     }
 
     public void queueMessage(ByteBuffer buffer) {

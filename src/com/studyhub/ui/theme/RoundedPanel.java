@@ -12,6 +12,8 @@ import javax.swing.JPanel;
  */
 public class RoundedPanel extends JPanel {
 
+    private static final long serialVersionUID = 1L;
+
     private int cornerRadius;
     private Color backgroundColor;
     private Color borderColor;
@@ -52,6 +54,10 @@ public class RoundedPanel extends JPanel {
         this.borderColor = border;
         this.borderWidth = width;
         repaint();
+    }
+
+    public void setBorderColor(Color border) {
+        setBorderColor(border, this.borderWidth > 0 ? this.borderWidth : 1);
     }
 
     @Override

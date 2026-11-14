@@ -42,4 +42,9 @@ public final class NetworkConfig {
     // Shared Storage Directory
     public static final String SHARED_STORAGE_DIR = "shared_storage";
     public static final String DOWNLOADS_DIR = "downloads";
+
+    // Disk Persistence (flat-file storage engine, see com.studyhub.common.DataPersistenceManager)
+    public static final String DATA_DIR = "data";
+    public static final int HISTORY_REPLAY_LIMIT = 50;   // messages replayed to a late joiner
+    public static final int RECONNECT_INTERVAL_MS = 3000; // client NIO SocketChannel retry backoff
 }

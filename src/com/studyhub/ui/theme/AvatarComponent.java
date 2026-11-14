@@ -14,6 +14,8 @@ import javax.swing.JComponent;
  */
 public class AvatarComponent extends JComponent {
 
+    private static final long serialVersionUID = 1L;
+
     private static final Color[] PALETTE = {
         new Color(0x58, 0x65, 0xF2), // Blurple
         new Color(0x57, 0xF2, 0x87), // Green

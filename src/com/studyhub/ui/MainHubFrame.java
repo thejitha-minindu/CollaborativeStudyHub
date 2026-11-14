@@ -1,11 +1,14 @@
 package com.studyhub.ui;
 
+import com.studyhub.common.DataPersistenceManager;
 import com.studyhub.common.NetworkConfig;
 import com.studyhub.common.PacketLogEvent;
 import com.studyhub.common.ProtocolConstants;
+import com.studyhub.concurrent.ResourceConcurrentEngine;
 import com.studyhub.nio.MessageFramer;
 import com.studyhub.security.CryptoIntegrityService;
 import com.studyhub.security.TlsAuthClient;
+import com.studyhub.transfer.FileNameUtils;
 import com.studyhub.transfer.FileTransferClient;
 import com.studyhub.transfer.SharedFileRecord;
 import com.studyhub.udp.PresencePulseService;
@@ -23,72 +26,98 @@ import java.awt.Desktop;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Font;
-import java.awt.Graphics;
-import java.awt.Graphics2D;
 import java.awt.GridLayout;
-import java.awt.RenderingHints;
+import java.awt.Toolkit;
+import java.awt.datatransfer.DataFlavor;
+import java.awt.datatransfer.Transferable;
+import java.awt.dnd.DnDConstants;
+import java.awt.dnd.DropTarget;
+import java.awt.dnd.DropTargetAdapter;
+import java.awt.dnd.DropTargetDropEvent;
+import java.awt.event.ActionEvent;
 import java.awt.event.AdjustmentEvent;
 import java.awt.event.AdjustmentListener;
 import java.awt.event.KeyAdapter;
 import java.awt.event.KeyEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
+import java.awt.event.WindowAdapter;
+import java.awt.event.WindowEvent;
 import java.io.File;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
-import java.time.LocalTime;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Pattern;
+import javax.swing.AbstractAction;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
 import javax.swing.DefaultListModel;
 import javax.swing.JButton;
-import javax.swing.JCheckBox;
+import javax.swing.JComboBox;
+import javax.swing.JComponent;
 import javax.swing.JDialog;
 import javax.swing.JFileChooser;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JLayeredPane;
 import javax.swing.JList;
+import javax.swing.JMenuItem;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
+import javax.swing.JPopupMenu;
+import javax.swing.JProgressBar;
 import javax.swing.JScrollBar;
 import javax.swing.JScrollPane;
 import javax.swing.JSplitPane;
 import javax.swing.JTextField;
+import javax.swing.KeyStroke;
 import javax.swing.ListCellRenderer;
 import javax.swing.ListSelectionModel;
-import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
 import javax.swing.Timer;
-import javax.swing.border.EmptyBorder;
 
 /**
- * [COLLABORATIVE STUDY HUB - REDESIGNED MODERN CLIENT]
+ * [COLLABORATIVE STUDY HUB - MODERN PERSISTENT CLIENT]
  * Discord/Slack-inspired 3-pane collaboration workspace with custom Java2D rendering,
- * rich message cards, active room management, room study vault, and live collapsible telemetry inspector.
+ * rich message cards (reply/quote + moderator pinning), unread room badges, toast alerts,
+ * drag-and-drop file sharing with a local downloads manager, live chat/vault search and
+ * an auto-reconnecting NIO SocketChannel session.
  */
 public class MainHubFrame extends JFrame {
+
+    private static final long serialVersionUID = 1L;
 
     private final LoginDiscoveryDialog.SessionData session;
     private final NetworkInspectorPanel inspectorPanel;
     private final MessageFramer framer = new MessageFramer();
     private final AtomicLong pulseSeq = new AtomicLong(1);
 
-    // NIO Client Channel
+    /** Dedicated pool for the asynchronous {@code FileSearchCallable} vault filter. */
+    private final ResourceConcurrentEngine searchEngine = new ResourceConcurrentEngine(2);
+
+    // NIO Client Channel + resilience
     private SocketChannel nioChannel;
     private Thread nioReaderThread;
     private volatile boolean connected = false;
+    private volatile boolean intentionalDisconnect = false;
+    private volatile boolean reconnectInProgress = false;
+    private Timer reconnectTimer;
+    private int reconnectAttempt = 0;
 
     // Room & Navigation State
     private String currentRoom = ProtocolConstants.DEFAULT_ROOMS[0];
     private final List<String> roomList = new ArrayList<>();
+    private final Map<String, String> roomTopics = new LinkedHashMap<>();
+    private final Map<String, Integer> unreadByRoom = new LinkedHashMap<>();
     private final JPanel roomsContainer = new JPanel();
 
     // Member & Vault Models
@@ -102,14 +131,40 @@ public class MainHubFrame extends JFrame {
     // Feed & Composer
     private final JPanel chatFeedPanel = new JPanel();
     private final JScrollPane chatScrollPane = new JScrollPane(chatFeedPanel);
+    private final List<MessageCard> messageCards = new ArrayList<>();
+    private final Component chatFiller = Box.createVerticalGlue();
     private final JTextField messageInput = new JTextField();
     private final PillButton sendBtn = new PillButton("Send");
     private final PillButton aesToggleBtn = new PillButton("🔒 AES-128: ON", ThemeColors.STATUS_ONLINE, ThemeColors.STATUS_ONLINE.darker(), ThemeColors.TEXT_PRIMARY, 14);
     private final PillButton tamperToggleBtn = new PillButton("⚠ Tamper Test: OFF", ThemeColors.BG_INPUT, ThemeColors.BG_HOVER, ThemeColors.TEXT_MUTED, 14);
     private final JLabel typingIndicatorLabel = new JLabel(" ");
     private final JLabel currentRoomHeaderLabel = new JLabel("#general");
-    private final JLabel currentRoomDescLabel = new JLabel("General study discussion and resource sharing");
+    private final JLabel currentRoomTopicLabel = new JLabel("General study discussion and resource sharing");
     private PillButton newMessagesFloatBtn;
+
+    // Banners
+    private final JPanel topBannerHost = new JPanel();
+    private final JPanel reconnectBanner = new JPanel(new BorderLayout(10, 0));
+    private final JLabel reconnectLabel = new JLabel("⟳ Reconnecting to Study Hub...");
+    private final RoundedPanel pinnedBanner = new RoundedPanel(10, ThemeColors.BG_CARD, ThemeColors.ACCENT_PRIMARY, 1);
+    private final JLabel pinnedLabel = new JLabel(" ");
+    private final JButton unpinBtn = new JButton("✕");
+    private String pinnedPayload = "";
+
+    // Reply / quote state
+    private ReplyReference pendingReply = null;
+    private final JPanel replyBanner = new JPanel(new BorderLayout(10, 0));
+    private final JLabel replyLabel = new JLabel(" ");
+
+    // Search (Ctrl+F)
+    private final JPanel searchPanel = new JPanel(new BorderLayout(8, 0));
+    private final JTextField searchField = new JTextField();
+    private final JLabel searchCountLabel = new JLabel("");
+    private String activeSearchQuery = "";
+
+    // Vault search (FileSearchCallable)
+    private String pendingVaultQuery = "";
+    private Timer vaultSearchTimer;
 
     // Collapsible Inspector Drawer
     private JSplitPane verticalDrawerSplit;
@@ -122,6 +177,7 @@ public class MainHubFrame extends JFrame {
     private Timer idlePulseTimer;
     private Timer typingDebounceTimer;
     private String lastSender = "";
+    private String currentStatus = ProtocolConstants.STATUS_AVAILABLE;
 
     public static class MemberItem {
         public final String username;
@@ -135,6 +191,35 @@ public class MainHubFrame extends JFrame {
         }
     }
 
+    /** Immutable snapshot of the message a composer reply refers to. */
+    private static final class ReplyReference {
+        final String sender;
+        final String snippet;
+        final String time;
+
+        ReplyReference(String sender, String snippet, String time) {
+            this.sender = sender;
+            this.snippet = snippet;
+            this.time = time != null ? time : "";
+        }
+
+        /** Wire format (fields escaped so it stays a single protocol field). */
+        String toWire() {
+            return DataPersistenceManager.encodeField(sender)
+                + "|" + DataPersistenceManager.encodeField(snippet)
+                + "|" + DataPersistenceManager.encodeField(time);
+        }
+
+        static ReplyReference fromWire(String wire) {
+            if (wire == null || wire.trim().isEmpty()) return null;
+            String[] parts = wire.split(ProtocolConstants.DELIMITER_REGEX, -1);
+            String sender = parts.length > 0 ? DataPersistenceManager.decodeField(parts[0]) : "";
+            String snippet = parts.length > 1 ? DataPersistenceManager.decodeField(parts[1]) : "";
+            String time = parts.length > 2 ? DataPersistenceManager.decodeField(parts[2]) : "";
+            return sender.isEmpty() ? null : new ReplyReference(sender, snippet, time);
+        }
+    }
+
     public MainHubFrame(LoginDiscoveryDialog.SessionData session, NetworkInspectorPanel inspectorPanel) {
         super("Collaborative Study Hub — " + session.username + " (" + session.role + ")");
         this.session = session;
@@ -142,6 +227,7 @@ public class MainHubFrame extends JFrame {
 
         for (String r : ProtocolConstants.DEFAULT_ROOMS) {
             roomList.add(r);
+            roomTopics.put(r, DataPersistenceManager.defaultRoomTopic(r));
         }
 
         buildDiscordLikeUI();
@@ -149,11 +235,14 @@ public class MainHubFrame extends JFrame {
         startPresenceHeartbeat();
     }
 
+    // =========================================================================
+    // ROOT LAYOUT
+    // =========================================================================
     private void buildDiscordLikeUI() {
-        setSize(1240, 840);
-        setMinimumSize(new Dimension(1020, 680));
+        setSize(1280, 860);
+        setMinimumSize(new Dimension(1040, 700));
         setLocationRelativeTo(null);
-        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
         getContentPane().setBackground(ThemeColors.BG_CHAT);
         setLayout(new BorderLayout());
 
@@ -163,7 +252,7 @@ public class MainHubFrame extends JFrame {
         JPanel rightPane = buildRightSidebar();
 
         JSplitPane centerRightSplit = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, centerPane, rightPane);
-        centerRightSplit.setDividerLocation(760);
+        centerRightSplit.setDividerLocation(780);
         centerRightSplit.setDividerSize(1);
         centerRightSplit.setBorder(null);
 
@@ -174,16 +263,141 @@ public class MainHubFrame extends JFrame {
 
         // Bottom Collapsible Inspector Drawer Split
         verticalDrawerSplit = new JSplitPane(JSplitPane.VERTICAL_SPLIT, mainHorizontalSplit, inspectorPanel);
-        verticalDrawerSplit.setDividerLocation(840); // Collapsed by default
+        verticalDrawerSplit.setDividerLocation(860); // Collapsed by default
         verticalDrawerSplit.setDividerSize(1);
         verticalDrawerSplit.setBorder(null);
         inspectorPanel.setVisible(false);
 
+        add(buildTopBannerHost(), BorderLayout.NORTH);
         add(verticalDrawerSplit, BorderLayout.CENTER);
+
+        installGlobalShortcuts();
+        installWindowHooks();
+    }
+
+    private JPanel buildTopBannerHost() {
+        topBannerHost.setLayout(new BoxLayout(topBannerHost, BoxLayout.Y_AXIS));
+        topBannerHost.setBackground(ThemeColors.BG_RAIL);
+
+        // --- Reconnecting banner (non-blocking, only shown while the link is down) ---
+        reconnectBanner.setBackground(new Color(0x3A, 0x2F, 0x12));
+        reconnectBanner.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createMatteBorder(0, 0, 1, 0, ThemeColors.STATUS_TYPING),
+            BorderFactory.createEmptyBorder(8, 18, 8, 18)
+        ));
+        reconnectLabel.setFont(ThemeColors.FONT_BOLD);
+        reconnectLabel.setForeground(ThemeColors.STATUS_TYPING);
+
+        JLabel spinner = new JLabel("⟳");
+        spinner.setFont(new Font("Segoe UI", Font.BOLD, 15));
+        spinner.setForeground(ThemeColors.STATUS_TYPING);
+
+        reconnectBanner.add(spinner, BorderLayout.WEST);
+        reconnectBanner.add(reconnectLabel, BorderLayout.CENTER);
+        reconnectBanner.setVisible(false);
+
+        // --- Pinned message banner ---
+        pinnedBanner.setLayout(new BorderLayout(10, 0));
+        pinnedBanner.setMaximumSize(new Dimension(Integer.MAX_VALUE, 46));
+        pinnedBanner.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createEmptyBorder(6, 14, 6, 14),
+            BorderFactory.createEmptyBorder(6, 12, 6, 12)
+        ));
+
+        JLabel pinIcon = new JLabel("📌 PINNED");
+        pinIcon.setFont(ThemeColors.FONT_BOLD);
+        pinIcon.setForeground(ThemeColors.ACCENT_PRIMARY);
+
+        pinnedLabel.setFont(ThemeColors.FONT_BODY);
+        pinnedLabel.setForeground(ThemeColors.TEXT_PRIMARY);
+
+        unpinBtn.setFont(ThemeColors.FONT_BOLD);
+        unpinBtn.setForeground(ThemeColors.TEXT_MUTED);
+        unpinBtn.setContentAreaFilled(false);
+        unpinBtn.setBorderPainted(false);
+        unpinBtn.setFocusPainted(false);
+        unpinBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        unpinBtn.setToolTipText("Unpin (moderators only)");
+        unpinBtn.addActionListener(e -> clearPinnedMessage());
+
+        pinnedBanner.add(pinIcon, BorderLayout.WEST);
+        pinnedBanner.add(pinnedLabel, BorderLayout.CENTER);
+        pinnedBanner.add(unpinBtn, BorderLayout.EAST);
+        pinnedBanner.setVisible(false);
+
+        topBannerHost.add(reconnectBanner);
+        topBannerHost.add(pinnedBanner);
+        return topBannerHost;
+    }
+
+    /**
+     * Chat canvas layered pane: keeps the message scroll pane full-bleed while floating
+     * the "jump to latest messages" pill above it.
+     */
+    private class ChatLayerPane extends JLayeredPane {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public void doLayout() {
+            int w = getWidth();
+            int h = getHeight();
+            chatScrollPane.setBounds(0, 0, w, h);
+            Dimension d = newMessagesFloatBtn.getPreferredSize();
+            newMessagesFloatBtn.setBounds((w - d.width) / 2, h - d.height - 14, d.width, d.height);
+        }
+
+        @Override
+        public Dimension getPreferredSize() {
+            return chatScrollPane.getPreferredSize();
+        }
+    }
+
+    private void installGlobalShortcuts() {
+        getRootPane().getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW)
+            .put(KeyStroke.getKeyStroke(KeyEvent.VK_F, Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx()), "focusMessageSearch");
+        getRootPane().getActionMap().put("focusMessageSearch", new AbstractAction() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                toggleMessageSearch(true);
+            }
+        });
+    }
+
+    private void installWindowHooks() {
+        addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowClosing(WindowEvent e) {
+                shutdownNetworking();
+                dispose();
+                System.exit(0);
+            }
+        });
+    }
+
+    /** Stops every client-side networking task before the window goes away. */
+    private void shutdownNetworking() {
+        intentionalDisconnect = true;
+        connected = false;
+        if (idlePulseTimer != null) idlePulseTimer.stop();
+        if (typingDebounceTimer != null) typingDebounceTimer.stop();
+        if (reconnectTimer != null) reconnectTimer.stop();
+        if (vaultSearchTimer != null) vaultSearchTimer.stop();
+        closeChannel();
+        searchEngine.shutdown();
+    }
+
+    private void closeChannel() {
+        try {
+            if (nioChannel != null && nioChannel.isOpen()) {
+                nioChannel.close();
+            }
+        } catch (IOException ignored) {}
     }
 
     // =========================================================================
-    // 1. LEFT SIDEBAR (Rooms, Security Status, Profile)
+    // 1. LEFT SIDEBAR (Rooms + Unread Badges, Security Status, Profile)
     // =========================================================================
     private JPanel buildLeftSidebar() {
         JPanel left = new JPanel(new BorderLayout());
@@ -209,9 +423,15 @@ public class MainHubFrame extends JFrame {
         tlsVerifiedPill.setBorderColor(ThemeColors.STATUS_ONLINE);
         tlsVerifiedPill.addActionListener(e -> showTlsCertDialog());
 
+        PillButton vaultPill = new PillButton("📂 Open Downloads Folder", ThemeColors.BG_CARD, ThemeColors.BG_HOVER, ThemeColors.TEXT_MUTED, 12);
+        vaultPill.setFont(ThemeColors.FONT_MUTED);
+        vaultPill.addActionListener(e -> openDownloadsFolder());
+
         topHubHeader.add(hubTitle);
         topHubHeader.add(Box.createVerticalStrut(6));
         topHubHeader.add(tlsVerifiedPill);
+        topHubHeader.add(Box.createVerticalStrut(4));
+        topHubHeader.add(vaultPill);
 
         // Rooms Navigation Section
         JPanel roomsSection = new JPanel(new BorderLayout());
@@ -233,6 +453,7 @@ public class MainHubFrame extends JFrame {
         addRoomBtn.setBorderPainted(false);
         addRoomBtn.setFocusPainted(false);
         addRoomBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        addRoomBtn.setToolTipText("Create a persistent study room");
         addRoomBtn.addActionListener(e -> promptCreateRoom());
 
         roomsHeaderBar.add(roomsCategory, BorderLayout.WEST);
@@ -262,24 +483,25 @@ public class MainHubFrame extends JFrame {
     }
 
     private JPanel buildUserProfileBar() {
-        JPanel bar = new JPanel(new BorderLayout());
+        JPanel bar = new JPanel(new BorderLayout(0, 8));
         bar.setBackground(ThemeColors.BG_CARD);
         bar.setBorder(BorderFactory.createCompoundBorder(
             BorderFactory.createMatteBorder(1, 0, 0, 0, ThemeColors.BORDER_SUBTLE),
-            BorderFactory.createEmptyBorder(10, 14, 10, 14)
+            BorderFactory.createEmptyBorder(10, 12, 10, 12)
         ));
 
         // User Avatar + Name + Role
-        JPanel userPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
+        JPanel userPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
         userPanel.setOpaque(false);
 
-        AvatarComponent avatar = new AvatarComponent(session.username, 36, ThemeColors.STATUS_ONLINE, true);
+        AvatarComponent avatar = new AvatarComponent(session.username, 34, ThemeColors.STATUS_ONLINE, true);
 
         JPanel namePanel = new JPanel();
         namePanel.setLayout(new BoxLayout(namePanel, BoxLayout.Y_AXIS));
         namePanel.setOpaque(false);
 
-        JLabel usernameLabel = new JLabel(session.username);
+        String display = (session.displayName != null && !session.displayName.isEmpty()) ? session.displayName : session.username;
+        JLabel usernameLabel = new JLabel(display);
         usernameLabel.setFont(ThemeColors.FONT_HEADER);
         usernameLabel.setForeground(ThemeColors.TEXT_PRIMARY);
 
@@ -293,13 +515,43 @@ public class MainHubFrame extends JFrame {
         userPanel.add(avatar);
         userPanel.add(namePanel);
 
-        // Inspector Drawer Toggle Button
+        // Live study status (broadcast over the existing UDP PULSE protocol, port 9877)
+        final JComboBox<String> statusCombo = new JComboBox<>(new String[]{"Available", "Focusing / Do Not Disturb", "In Lab"});
+        statusCombo.setFont(ThemeColors.FONT_MUTED);
+        statusCombo.setBackground(ThemeColors.BG_INPUT);
+        statusCombo.setForeground(ThemeColors.TEXT_PRIMARY);
+        statusCombo.setToolTipText("Live study status broadcast via UDP PULSE (Port 9877)");
+        statusCombo.addActionListener(e -> {
+            int idx = statusCombo.getSelectedIndex();
+            currentStatus = ProtocolConstants.SELECTABLE_STATUSES[Math.max(0, Math.min(idx, ProtocolConstants.SELECTABLE_STATUSES.length - 1))];
+            emitPresencePulse(currentStatus);
+        });
+
+        // Bottom row: Inspector drawer + Switch user
+        JPanel buttonRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        buttonRow.setOpaque(false);
+
         inspectorToggleBtn = new PillButton("⚡ Inspector", ThemeColors.BG_INPUT, ThemeColors.BG_HOVER, ThemeColors.TEXT_MUTED, 12);
         inspectorToggleBtn.setFont(ThemeColors.FONT_MUTED);
         inspectorToggleBtn.addActionListener(e -> toggleInspectorDrawer());
 
-        bar.add(userPanel, BorderLayout.WEST);
-        bar.add(inspectorToggleBtn, BorderLayout.EAST);
+        PillButton logoutBtn = new PillButton("⇄ Switch User", ThemeColors.BG_INPUT, ThemeColors.STATUS_DANGER, ThemeColors.TEXT_MUTED, 12);
+        logoutBtn.setFont(ThemeColors.FONT_MUTED);
+        logoutBtn.setToolTipText("Log out and sign in as another group member");
+        logoutBtn.addActionListener(e -> switchUser());
+
+        buttonRow.add(inspectorToggleBtn);
+        buttonRow.add(logoutBtn);
+
+        JPanel southPanel = new JPanel();
+        southPanel.setLayout(new BoxLayout(southPanel, BoxLayout.Y_AXIS));
+        southPanel.setOpaque(false);
+        southPanel.add(statusCombo);
+        southPanel.add(Box.createVerticalStrut(6));
+        southPanel.add(buttonRow);
+
+        bar.add(userPanel, BorderLayout.NORTH);
+        bar.add(southPanel, BorderLayout.SOUTH);
 
         return bar;
     }
@@ -308,6 +560,7 @@ public class MainHubFrame extends JFrame {
         roomsContainer.removeAll();
         for (String room : roomList) {
             boolean isActive = room.equalsIgnoreCase(currentRoom);
+            Integer unread = unreadByRoom.get(room);
 
             RoundedPanel roomCard = new RoundedPanel(8, isActive ? ThemeColors.BG_HOVER : ThemeColors.BG_RAIL);
             roomCard.setLayout(new BorderLayout(8, 0));
@@ -326,6 +579,16 @@ public class MainHubFrame extends JFrame {
             roomCard.add(hash, BorderLayout.WEST);
             roomCard.add(name, BorderLayout.CENTER);
 
+            if (unread != null && unread > 0 && !isActive) {
+                JLabel badge = new JLabel(" " + unread + " ");
+                badge.setFont(new Font("Segoe UI", Font.BOLD, 10));
+                badge.setForeground(ThemeColors.TEXT_PRIMARY);
+                badge.setOpaque(true);
+                badge.setBackground(ThemeColors.STATUS_DANGER);
+                badge.setBorder(BorderFactory.createEmptyBorder(2, 4, 2, 4));
+                roomCard.add(badge, BorderLayout.EAST);
+            }
+
             roomCard.addMouseListener(new MouseAdapter() {
                 @Override
                 public void mouseClicked(MouseEvent e) {
@@ -343,16 +606,44 @@ public class MainHubFrame extends JFrame {
     }
 
     private void promptCreateRoom() {
-        String newRoom = JOptionPane.showInputDialog(this, "Enter new room name (e.g. #exam-prep):", "Create Study Room", JOptionPane.PLAIN_MESSAGE);
-        if (newRoom != null && !newRoom.trim().isEmpty()) {
-            String roomFormatted = newRoom.trim().startsWith("#") ? newRoom.trim() : "#" + newRoom.trim();
-            if (!roomList.contains(roomFormatted)) {
+        JPanel panel = new JPanel();
+        panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
+        JTextField nameField = new JTextField(18);
+        JTextField topicField = new JTextField(18);
+        panel.add(new JLabel("Room name (e.g. #operating-systems):"));
+        panel.add(nameField);
+        panel.add(Box.createVerticalStrut(6));
+        panel.add(new JLabel("Room topic / description:"));
+        panel.add(topicField);
+
+        int res = JOptionPane.showConfirmDialog(this, panel, "Create Persistent Study Room",
+            JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
+
+        if (res == JOptionPane.OK_OPTION && !nameField.getText().trim().isEmpty()) {
+            String raw = nameField.getText().trim();
+            String roomFormatted = raw.startsWith("#") ? raw : "#" + raw;
+            String topic = topicField.getText().trim();
+
+            // Ask the server to persist the room - it answers with a fresh ROOM_LIST.
+            sendNioFrame(ProtocolConstants.CMD_CREATE_ROOM + ProtocolConstants.DELIMITER
+                + roomFormatted + ProtocolConstants.DELIMITER
+                + DataPersistenceManager.encodeField(topic));
+
+            if (!containsIgnoreCase(roomList, roomFormatted)) {
                 roomList.add(roomFormatted);
+                roomTopics.put(roomFormatted, topic.isEmpty() ? DataPersistenceManager.defaultRoomTopic(roomFormatted) : topic);
                 refreshRoomsList();
-                switchRoom(roomFormatted);
-                ToastNotification.show(this, "Room Created", "Joined " + roomFormatted, ToastNotification.Type.SUCCESS);
             }
+            ToastNotification.show(this, "Study Room Created",
+                roomFormatted + " is now stored on the server and survives restarts.", ToastNotification.Type.SUCCESS);
         }
+    }
+
+    private static boolean containsIgnoreCase(List<String> list, String value) {
+        for (String s : list) {
+            if (s.equalsIgnoreCase(value)) return true;
+        }
+        return false;
     }
 
     private void toggleInspectorDrawer() {
@@ -368,14 +659,14 @@ public class MainHubFrame extends JFrame {
     }
 
     // =========================================================================
-    // 2. CENTER STAGE (Rich Message Stream & Composer)
+    // 2. CENTER STAGE (Rich Message Stream, Pinned Banner, Search & Composer)
     // =========================================================================
     private JPanel buildCenterStage() {
         JPanel center = new JPanel(new BorderLayout());
         center.setBackground(ThemeColors.BG_CHAT);
 
         // Top Room Header
-        JPanel topHeader = new JPanel(new BorderLayout());
+        JPanel topHeader = new JPanel(new BorderLayout(12, 0));
         topHeader.setBackground(ThemeColors.BG_CHAT);
         topHeader.setBorder(BorderFactory.createCompoundBorder(
             BorderFactory.createMatteBorder(0, 0, 1, 0, ThemeColors.BORDER_SUBTLE),
@@ -391,16 +682,20 @@ public class MainHubFrame extends JFrame {
         JLabel divider = new JLabel("|");
         divider.setForeground(ThemeColors.TEXT_MUTED);
 
-        currentRoomDescLabel.setFont(ThemeColors.FONT_MUTED);
-        currentRoomDescLabel.setForeground(ThemeColors.TEXT_MUTED);
+        currentRoomTopicLabel.setFont(ThemeColors.FONT_MUTED);
+        currentRoomTopicLabel.setForeground(ThemeColors.TEXT_MUTED);
 
         titlePanel.add(currentRoomHeaderLabel);
         titlePanel.add(divider);
-        titlePanel.add(currentRoomDescLabel);
+        titlePanel.add(currentRoomTopicLabel);
 
-        // Action Pills (Share File + Tamper Toggle)
-        JPanel actionPills = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 0));
+        // Action Pills (Search + Share File + Tamper Toggle)
+        JPanel actionPills = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
         actionPills.setOpaque(false);
+
+        PillButton searchBtn = new PillButton("🔍 Search (Ctrl+F)", ThemeColors.BG_INPUT, ThemeColors.BG_HOVER, ThemeColors.TEXT_MUTED, 14);
+        searchBtn.setFont(ThemeColors.FONT_MUTED);
+        searchBtn.addActionListener(e -> toggleMessageSearch(!searchPanel.isVisible()));
 
         PillButton shareFileTopBtn = new PillButton("📁 Share File", ThemeColors.ACCENT_PRIMARY, ThemeColors.ACCENT_HOVER, ThemeColors.TEXT_PRIMARY, 14);
         shareFileTopBtn.addActionListener(e -> chooseAndUploadFile());
@@ -417,21 +712,84 @@ public class MainHubFrame extends JFrame {
             }
         });
 
+        actionPills.add(searchBtn);
         actionPills.add(tamperToggleBtn);
         actionPills.add(shareFileTopBtn);
 
         topHeader.add(titlePanel, BorderLayout.WEST);
         topHeader.add(actionPills, BorderLayout.EAST);
 
-        // Chat Message Feed
+        // Message search bar (Ctrl+F)
+        searchPanel.setOpaque(false);
+        searchPanel.setBorder(BorderFactory.createEmptyBorder(6, 20, 6, 20));
+        searchField.setFont(ThemeColors.FONT_BODY);
+        searchField.setBackground(ThemeColors.BG_INPUT);
+        searchField.setForeground(ThemeColors.TEXT_PRIMARY);
+        searchField.setCaretColor(ThemeColors.TEXT_PRIMARY);
+        searchField.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(ThemeColors.BORDER_SUBTLE, 1),
+            BorderFactory.createEmptyBorder(4, 8, 4, 8)
+        ));
+        searchField.setToolTipText("Filter and highlight messages in this room (Esc to close)");
+        searchField.addKeyListener(new KeyAdapter() {
+            @Override
+            public void keyReleased(KeyEvent e) {
+                if (e.getKeyCode() == KeyEvent.VK_ESCAPE) {
+                    toggleMessageSearch(false);
+                    return;
+                }
+                applyMessageSearch(searchField.getText().trim());
+            }
+        });
+
+        JButton closeSearchBtn = new JButton("✕");
+        closeSearchBtn.setFont(ThemeColors.FONT_BOLD);
+        closeSearchBtn.setForeground(ThemeColors.TEXT_MUTED);
+        closeSearchBtn.setContentAreaFilled(false);
+        closeSearchBtn.setBorderPainted(false);
+        closeSearchBtn.setFocusPainted(false);
+        closeSearchBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        closeSearchBtn.addActionListener(e -> toggleMessageSearch(false));
+
+        searchCountLabel.setFont(ThemeColors.FONT_MUTED);
+        searchCountLabel.setForeground(ThemeColors.TEXT_MUTED);
+        searchCountLabel.setBorder(BorderFactory.createEmptyBorder(0, 8, 0, 8));
+
+        JPanel searchRow = new JPanel(new BorderLayout(6, 0));
+        searchRow.setOpaque(false);
+        searchRow.add(searchField, BorderLayout.CENTER);
+        searchRow.add(searchCountLabel, BorderLayout.EAST);
+        searchRow.add(closeSearchBtn, BorderLayout.WEST);
+
+        searchPanel.add(searchRow, BorderLayout.CENTER);
+        searchPanel.setVisible(false);
+
+        JPanel headerHost = new JPanel(new BorderLayout());
+        headerHost.setBackground(ThemeColors.BG_CHAT);
+        headerHost.add(topHeader, BorderLayout.NORTH);
+        headerHost.add(searchPanel, BorderLayout.SOUTH);
+
+        // Chat Message Feed (layered so the "jump to latest" pill can float)
         chatFeedPanel.setLayout(new BoxLayout(chatFeedPanel, BoxLayout.Y_AXIS));
         chatFeedPanel.setBackground(ThemeColors.BG_CHAT);
         chatFeedPanel.setBorder(BorderFactory.createEmptyBorder(12, 16, 12, 16));
+        chatFeedPanel.add(chatFiller);
 
         chatScrollPane.setBackground(ThemeColors.BG_CHAT);
         chatScrollPane.getViewport().setBackground(ThemeColors.BG_CHAT);
         chatScrollPane.setBorder(null);
         chatScrollPane.getVerticalScrollBar().setUI(new ModernScrollBarUI(6));
+
+        newMessagesFloatBtn = new PillButton("↓ New messages", ThemeColors.ACCENT_PRIMARY, ThemeColors.ACCENT_HOVER, ThemeColors.TEXT_PRIMARY, 14);
+        newMessagesFloatBtn.setFont(ThemeColors.FONT_MUTED);
+        newMessagesFloatBtn.setVisible(false);
+        newMessagesFloatBtn.addActionListener(e -> scrollToBottom());
+
+        JLayeredPane chatLayer = new ChatLayerPane();
+        chatLayer.add(chatScrollPane, JLayeredPane.DEFAULT_LAYER);
+        chatLayer.add(newMessagesFloatBtn, JLayeredPane.PALETTE_LAYER);
+
+        installDropTarget(chatScrollPane);
 
         // Smart scroll detection
         chatScrollPane.getVerticalScrollBar().addAdjustmentListener(new AdjustmentListener() {
@@ -451,8 +809,8 @@ public class MainHubFrame extends JFrame {
         // Bottom Composer Container
         JPanel bottomContainer = buildComposerSection();
 
-        center.add(topHeader, BorderLayout.NORTH);
-        center.add(chatScrollPane, BorderLayout.CENTER);
+        center.add(headerHost, BorderLayout.NORTH);
+        center.add(chatLayer, BorderLayout.CENTER);
         center.add(bottomContainer, BorderLayout.SOUTH);
 
         return center;
@@ -471,6 +829,27 @@ public class MainHubFrame extends JFrame {
         typingIndicatorLabel.setForeground(ThemeColors.STATUS_TYPING);
         typingRow.add(typingIndicatorLabel);
 
+        // Reply / quote banner
+        replyBanner.setOpaque(false);
+        replyBanner.setBorder(BorderFactory.createEmptyBorder(4, 2, 4, 2));
+        replyBanner.setMaximumSize(new Dimension(Integer.MAX_VALUE, 34));
+
+        replyLabel.setFont(ThemeColors.FONT_MUTED);
+        replyLabel.setForeground(ThemeColors.TEXT_MUTED);
+
+        JButton cancelReplyBtn = new JButton("✕");
+        cancelReplyBtn.setFont(ThemeColors.FONT_BOLD);
+        cancelReplyBtn.setForeground(ThemeColors.TEXT_MUTED);
+        cancelReplyBtn.setContentAreaFilled(false);
+        cancelReplyBtn.setBorderPainted(false);
+        cancelReplyBtn.setFocusPainted(false);
+        cancelReplyBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        cancelReplyBtn.addActionListener(e -> clearPendingReply());
+
+        replyBanner.add(replyLabel, BorderLayout.CENTER);
+        replyBanner.add(cancelReplyBtn, BorderLayout.EAST);
+        replyBanner.setVisible(false);
+
         // Input pill container
         RoundedPanel inputCard = new RoundedPanel(18, ThemeColors.BG_INPUT, ThemeColors.BORDER_SUBTLE, 1);
         inputCard.setLayout(new BorderLayout(8, 0));
@@ -484,6 +863,7 @@ public class MainHubFrame extends JFrame {
         attachBtn.setBorderPainted(false);
         attachBtn.setFocusPainted(false);
         attachBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        attachBtn.setToolTipText("Share a file (or just drag files onto the chat)");
         attachBtn.addActionListener(e -> chooseAndUploadFile());
 
         // Message text input
@@ -525,6 +905,7 @@ public class MainHubFrame extends JFrame {
         inputCard.add(rightTools, BorderLayout.EAST);
 
         container.add(typingRow);
+        container.add(replyBanner);
         container.add(Box.createVerticalStrut(4));
         container.add(inputCard);
 
@@ -532,12 +913,12 @@ public class MainHubFrame extends JFrame {
     }
 
     // =========================================================================
-    // 3. RIGHT SIDEBAR (Online Members & Room Study Vault)
+    // 3. RIGHT SIDEBAR (Online Members & Searchable Room Study Vault)
     // =========================================================================
     private JPanel buildRightSidebar() {
         JPanel right = new JPanel(new GridLayout(2, 1, 0, 1));
         right.setBackground(ThemeColors.BG_PANEL);
-        right.setPreferredSize(new Dimension(240, 0));
+        right.setPreferredSize(new Dimension(250, 0));
         right.setBorder(BorderFactory.createMatteBorder(0, 1, 0, 0, ThemeColors.BORDER_SUBTLE));
 
         // 1. Members Panel
@@ -574,24 +955,57 @@ public class MainHubFrame extends JFrame {
         vaultHeader.setFont(ThemeColors.FONT_BOLD);
         vaultHeader.setForeground(ThemeColors.TEXT_MUTED);
 
-        JTextField vaultSearchField = new JTextField("Search files...");
+        JTextField vaultSearchField = new JTextField();
         vaultSearchField.setFont(ThemeColors.FONT_MUTED);
         vaultSearchField.setBackground(ThemeColors.BG_INPUT);
         vaultSearchField.setForeground(ThemeColors.TEXT_MUTED);
         vaultSearchField.setCaretColor(ThemeColors.TEXT_PRIMARY);
+        vaultSearchField.setText("Search files...");
         vaultSearchField.setBorder(BorderFactory.createCompoundBorder(
             BorderFactory.createLineBorder(ThemeColors.BORDER_SUBTLE, 1),
             BorderFactory.createEmptyBorder(4, 8, 4, 8)
         ));
+        vaultSearchField.addFocusListener(new java.awt.event.FocusAdapter() {
+            @Override
+            public void focusGained(java.awt.event.FocusEvent e) {
+                if ("Search files...".equals(vaultSearchField.getText())) {
+                    vaultSearchField.setText("");
+                    vaultSearchField.setForeground(ThemeColors.TEXT_PRIMARY);
+                }
+            }
+            @Override
+            public void focusLost(java.awt.event.FocusEvent e) {
+                if (vaultSearchField.getText().trim().isEmpty()) {
+                    vaultSearchField.setText("Search files...");
+                    vaultSearchField.setForeground(ThemeColors.TEXT_MUTED);
+                }
+            }
+        });
         vaultSearchField.addKeyListener(new KeyAdapter() {
             @Override
             public void keyReleased(KeyEvent e) {
-                filterVaultFiles(vaultSearchField.getText().trim());
+                String text = vaultSearchField.getText();
+                pendingVaultQuery = "Search files...".equals(text) ? "" : text.trim();
+                scheduleVaultSearch();
             }
         });
 
         vaultList.setBackground(ThemeColors.BG_PANEL);
         vaultList.setCellRenderer(new VaultCellRenderer());
+        vaultList.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                int idx = vaultList.locationToIndex(e.getPoint());
+                if (idx < 0) return;
+                SharedFileRecord record = vaultModel.getElementAt(idx);
+                if (record == null) return;
+                if (e.getClickCount() == 2) {
+                    downloadAndOpen(record.getRoom(), record.getFilename());
+                } else if (e.getClickCount() == 1) {
+                    downloadFile(record.getRoom(), record.getFilename(), null);
+                }
+            }
+        });
 
         JScrollPane vaultScroll = new JScrollPane(vaultList);
         vaultScroll.setBorder(null);
@@ -613,7 +1027,7 @@ public class MainHubFrame extends JFrame {
     }
 
     // =========================================================================
-    // NETWORKING: NIO SocketChannel Multiplexing
+    // NETWORKING: NIO SocketChannel Multiplexing + Auto-Reconnect
     // =========================================================================
     private void connectToNioServer() {
         new Thread(() -> {
@@ -629,12 +1043,8 @@ public class MainHubFrame extends JFrame {
                     "Connected to " + session.host + ":" + session.nioPort
                 ));
 
-                // Send HELLO handshake
-                String hello = ProtocolConstants.CMD_HELLO + ProtocolConstants.DELIMITER +
-                    session.sessionToken + ProtocolConstants.DELIMITER + session.username;
-                sendNioFrame(hello);
-
-                readNioLoop();
+                sendHelloAndJoin();
+                startNioReader();
 
             } catch (Exception e) {
                 inspectorPanel.logEvent(new PacketLogEvent(
@@ -643,44 +1053,150 @@ public class MainHubFrame extends JFrame {
                     "NIO Connect Failed",
                     e.getMessage()
                 ));
+                SwingUtilities.invokeLater(this::handleDisconnected);
             }
         }, "NIO-Client-Worker").start();
     }
 
-    private void readNioLoop() {
-        ByteBuffer readBuf = ByteBuffer.allocate(NetworkConfig.NIO_BUFFER_CAPACITY);
-        while (connected && nioChannel.isOpen()) {
-            try {
-                int read = nioChannel.read(readBuf);
-                if (read == -1) break;
-                if (read > 0) {
-                    List<String> frames = framer.extractFrames(readBuf);
-                    for (String frame : frames) {
-                        handleInboundNioFrame(frame);
+    private void sendHelloAndJoin() {
+        // Send HELLO handshake
+        String hello = ProtocolConstants.CMD_HELLO + ProtocolConstants.DELIMITER +
+            session.sessionToken + ProtocolConstants.DELIMITER + session.username;
+        sendNioFrame(hello);
+
+        // Re-enter the room we were in (critical after an auto-reconnect)
+        String join = ProtocolConstants.CMD_JOIN + ProtocolConstants.DELIMITER + currentRoom;
+        sendNioFrame(join);
+    }
+
+    private void startNioReader() {
+        if (nioReaderThread != null && nioReaderThread.isAlive()) {
+            return;
+        }
+        nioReaderThread = new Thread(() -> {
+            ByteBuffer readBuf = ByteBuffer.allocate(NetworkConfig.NIO_BUFFER_CAPACITY);
+            while (connected && nioChannel != null && nioChannel.isOpen()) {
+                try {
+                    int read = nioChannel.read(readBuf);
+                    if (read == -1) break;
+                    if (read > 0) {
+                        List<String> frames = framer.extractFrames(readBuf);
+                        for (String frame : frames) {
+                            handleInboundNioFrame(frame);
+                        }
                     }
+                } catch (Exception e) {
+                    break;
                 }
-            } catch (Exception e) {
-                break;
             }
+            connected = false;
+            if (!intentionalDisconnect) {
+                SwingUtilities.invokeLater(this::handleDisconnected);
+            }
+        }, "NIO-Client-Reader");
+        nioReaderThread.setDaemon(true);
+        nioReaderThread.start();
+    }
+
+    private void handleDisconnected() {
+        if (intentionalDisconnect) {
+            return;
         }
         connected = false;
+        reconnectAttempt = 0;
+        showReconnectBanner(true);
+
+        if (reconnectTimer == null) {
+            reconnectTimer = new Timer(NetworkConfig.RECONNECT_INTERVAL_MS, e -> attemptReconnect());
+        }
+        if (!reconnectTimer.isRunning()) {
+            reconnectTimer.start();
+        }
+    }
+
+    private void showReconnectBanner(boolean visible) {
+        reconnectBanner.setVisible(visible);
+        topBannerHost.revalidate();
+        topBannerHost.repaint();
+    }
+
+    /** Re-authenticates over TLS and re-establishes the NIO session without closing the window. */
+    private void attemptReconnect() {
+        if (reconnectInProgress || intentionalDisconnect) {
+            return;
+        }
+        reconnectInProgress = true;
+        reconnectAttempt++;
+        reconnectLabel.setText("⟳ Reconnecting to Study Hub... (attempt " + reconnectAttempt + ")");
+
+        new Thread(() -> {
+            boolean restored = false;
+            try {
+                TlsAuthClient authClient = new TlsAuthClient(session.host, session.tlsPort, inspectorPanel::logEvent);
+                TlsAuthClient.AuthResult result = (session.passwordSha256 == null || session.passwordSha256.isEmpty())
+                    ? null
+                    : authClient.authenticateHashed(session.username, session.passwordSha256);
+
+                if (result != null && result.success) {
+                    // Refresh the volatile session material issued by the auth server
+                    session.sessionToken = result.sessionToken;
+                    session.aesKeyBase64 = result.aesKeyBase64;
+
+                    SocketChannel fresh = SocketChannel.open();
+                    fresh.connect(new InetSocketAddress(session.host, session.nioPort));
+                    nioChannel = fresh;
+                    connected = true;
+                    restored = true;
+
+                    inspectorPanel.logEvent(new PacketLogEvent(
+                        PacketLogEvent.Module.NIO_SELECTOR,
+                        PacketLogEvent.Direction.TX,
+                        "NIO Session Restored",
+                        "Re-authenticated over TLS 9443 and re-opened SocketChannel on "
+                            + session.host + ":" + session.nioPort
+                    ));
+                }
+            } catch (Exception e) {
+                inspectorPanel.logEvent(new PacketLogEvent(
+                    PacketLogEvent.Module.NIO_SELECTOR,
+                    PacketLogEvent.Direction.INTERNAL,
+                    "Reconnect Attempt Failed",
+                    e.getMessage()
+                ));
+            }
+
+            final boolean ok = restored;
+            SwingUtilities.invokeLater(() -> {
+                reconnectInProgress = false;
+                if (ok) {
+                    if (reconnectTimer != null) reconnectTimer.stop();
+                    showReconnectBanner(false);
+                    sendHelloAndJoin();
+                    startNioReader();
+                    ToastNotification.show(MainHubFrame.this, "Reconnected",
+                        "Study Hub session restored - you are back in " + currentRoom, ToastNotification.Type.SUCCESS);
+                }
+            });
+        }, "NIO-Reconnect").start();
     }
 
     private void handleInboundNioFrame(String frame) {
-        String[] parts = frame.split(ProtocolConstants.DELIMITER_REGEX);
+        String[] parts = frame.split(ProtocolConstants.DELIMITER_REGEX, -1);
         if (parts.length == 0) return;
 
         String type = parts[0];
         SwingUtilities.invokeLater(() -> {
             switch (type) {
-                case ProtocolConstants.EVT_CHAT:
-                    // Format: CHAT|<room>|<sender>|<encFlag>|<content>|<time>
+                case ProtocolConstants.EVT_CHAT: {
+                    // CHAT|<room>|<sender>|<encFlag>|<content>|<time>[|<replyRef>]
                     if (parts.length >= 6) {
+                        boolean hasReply = parts.length >= 7;
                         String room = parts[1];
                         String sender = parts[2];
                         String encFlag = parts[3];
-                        String content = parts[4];
-                        String time = parts[5];
+                        String content = joinRange(parts, 4, hasReply ? parts.length - 2 : parts.length - 1);
+                        String time = hasReply ? parts[parts.length - 2] : parts[parts.length - 1];
+                        String replyRef = hasReply ? parts[parts.length - 1] : "";
 
                         String displayContent = content;
                         if (ProtocolConstants.ENC_AES.equalsIgnoreCase(encFlag)) {
@@ -691,12 +1207,14 @@ public class MainHubFrame extends JFrame {
                             }
                         }
 
-                        renderChatMessageCard(sender, displayContent, time, ProtocolConstants.ENC_AES.equalsIgnoreCase(encFlag));
+                        onChatArrived(room, sender, displayContent, time,
+                            ProtocolConstants.ENC_AES.equalsIgnoreCase(encFlag), replyRef);
                     }
                     break;
+                }
 
-                case ProtocolConstants.EVT_USER_LIST:
-                    // Format: USER_LIST|<room>|<user:status>|...
+                case ProtocolConstants.EVT_USER_LIST: {
+                    // USER_LIST|<room>|<user:status>|...
                     if (parts.length >= 2) {
                         String room = parts[1];
                         if (room.equalsIgnoreCase(currentRoom)) {
@@ -711,29 +1229,23 @@ public class MainHubFrame extends JFrame {
                         }
                     }
                     break;
+                }
 
                 case ProtocolConstants.EVT_PRESENCE_UPDATE:
-                    // Format: PRESENCE_UPDATE|<room>|<user>|<status>
                     if (parts.length >= 4) {
-                        String user = parts[2];
-                        String status = parts[3];
-                        updateMemberStatus(user, status);
+                        updateMemberStatus(parts[2], parts[3]);
                     }
                     break;
 
                 case ProtocolConstants.EVT_LINK_CARD:
-                    // Format: LINK_CARD|<room>|<url>|<ip>|<status>|<title>
+                    // LINK_CARD|<room>|<url>|<ip>|<status>|<title>
                     if (parts.length >= 6) {
-                        String url = parts[2];
-                        String ip = parts[3];
-                        String status = parts[4];
-                        String title = parts[5];
-                        renderLinkPreviewCard(url, ip, status, title);
+                        renderLinkPreviewCard(parts[2], parts[3], parts[4], parts[5]);
                     }
                     break;
 
-                case ProtocolConstants.EVT_FILE_ADDED:
-                    // Format: FILE_ADDED|<room>|<filename>|<size>|<uploader>|<sha256>
+                case ProtocolConstants.EVT_FILE_ADDED: {
+                    // FILE_ADDED|<room>|<filename>|<size>|<uploader>|<sha256>
                     if (parts.length >= 6) {
                         String room = parts[1];
                         String filename = parts[2];
@@ -741,14 +1253,93 @@ public class MainHubFrame extends JFrame {
                         String uploader = parts[4];
                         String sha256 = parts[5];
 
-                        SharedFileRecord rec = new SharedFileRecord("vault_" + filename, room, filename, size, sha256, uploader);
-                        allRoomFiles.add(rec);
-                        vaultModel.addElement(rec);
-
-                        renderFileVaultCard(room, filename, size, uploader, sha256);
-                        ToastNotification.show(this, "New File Shared", filename + " in " + room, ToastNotification.Type.SUCCESS);
+                        if (room.equalsIgnoreCase(currentRoom)) {
+                            SharedFileRecord rec = new SharedFileRecord("vault_" + filename, room, filename, size, sha256, uploader);
+                            if (!containsFile(allRoomFiles, filename)) {
+                                allRoomFiles.add(rec);
+                            }
+                            refreshVaultModel();
+                            renderFileVaultCard(room, filename, size, uploader, sha256);
+                        }
+                        if (!uploader.equalsIgnoreCase(session.username)) {
+                            ToastNotification.show(MainHubFrame.this, "New File Shared",
+                                filename + " in " + room + " by " + uploader, ToastNotification.Type.SUCCESS);
+                            Toolkit.getDefaultToolkit().beep();
+                        }
                     }
                     break;
+                }
+
+                case ProtocolConstants.EVT_VAULT_LIST: {
+                    // VAULT_LIST|<room>|<fileId>|<original>|<stored>|<size>|<sha>|<uploader>|<timestamp>
+                    if (parts.length >= 9) {
+                        String room = parts[1];
+                        if (room.equalsIgnoreCase(currentRoom)) {
+                            String fileId = DataPersistenceManager.decodeField(parts[2]);
+                            String original = DataPersistenceManager.decodeField(parts[3]);
+                            String stored = DataPersistenceManager.decodeField(parts[4]);
+                            long size = Long.parseLong(parts[5]);
+                            String sha = DataPersistenceManager.decodeField(parts[6]);
+                            String uploader = DataPersistenceManager.decodeField(parts[7]);
+                            String ts = DataPersistenceManager.decodeField(parts[8]);
+
+                            if (!containsFile(allRoomFiles, original)) {
+                                allRoomFiles.add(new SharedFileRecord(fileId, room, original, stored, size, sha, uploader, ts));
+                                refreshVaultModel();
+                            }
+                        }
+                    }
+                    break;
+                }
+
+                case ProtocolConstants.EVT_HISTORY_BATCH: {
+                    // HISTORY_BATCH|<room>|<count>|<entry>|<entry>|...
+                    if (parts.length >= 3) {
+                        String room = parts[1];
+                        int count = Integer.parseInt(parts[2]);
+                        if (room.equalsIgnoreCase(currentRoom) && count > 0) {
+                            renderSystemNotice("Restored " + count + " previous message(s) from this room");
+                            for (int i = 3; i < parts.length; i++) {
+                                renderHistoryEntry(parts[i]);
+                            }
+                        }
+                    }
+                    break;
+                }
+
+                case ProtocolConstants.EVT_ROOM_LIST: {
+                    // ROOM_LIST|<room>:<topic>|...
+                    List<String> refreshed = new ArrayList<>();
+                    for (int i = 1; i < parts.length; i++) {
+                        String[] rt = parts[i].split(":", 2);
+                        String room = DataPersistenceManager.decodeField(rt[0]);
+                        String topic = rt.length > 1 ? DataPersistenceManager.decodeField(rt[1]) : "";
+                        if (room.isEmpty()) continue;
+                        refreshed.add(room);
+                        roomTopics.put(room, topic);
+                        if (room.equalsIgnoreCase(currentRoom) && !topic.isEmpty()) {
+                            currentRoomTopicLabel.setText(topic);
+                        }
+                    }
+                    if (!refreshed.isEmpty()) {
+                        roomList.clear();
+                        roomList.addAll(refreshed);
+                        refreshRoomsList();
+                    }
+                    break;
+                }
+
+                case ProtocolConstants.EVT_PINNED: {
+                    // PINNED|<room>|<payload>
+                    if (parts.length >= 2) {
+                        String room = parts[1];
+                        String payload = parts.length >= 3 ? parts[2] : "";
+                        if (room.equalsIgnoreCase(currentRoom)) {
+                            showPinnedBanner(payload);
+                        }
+                    }
+                    break;
+                }
 
                 case ProtocolConstants.EVT_SYSTEM:
                     if (parts.length >= 2) {
@@ -759,7 +1350,101 @@ public class MainHubFrame extends JFrame {
         });
     }
 
-    private void sendNioFrame(String payload) {
+    private static String joinRange(String[] parts, int from, int to) {
+        if (to <= from) return "";
+        StringBuilder sb = new StringBuilder();
+        for (int i = from; i < to && i < parts.length; i++) {
+            if (i > from) sb.append(ProtocolConstants.DELIMITER);
+            sb.append(parts[i]);
+        }
+        return sb.toString();
+    }
+
+    private static boolean containsFile(List<SharedFileRecord> records, String filename) {
+        for (SharedFileRecord r : records) {
+            if (r.getFilename().equalsIgnoreCase(filename)) return true;
+        }
+        return false;
+    }
+
+    /** Renders one replayed {@code data/history_<room>.log} line into the feed. */
+    private void renderHistoryEntry(String line) {
+        DataPersistenceManager.HistoryEntry entry = DataPersistenceManager.HistoryEntry.fromLine(line);
+        if (entry == null) return;
+
+        if (ProtocolConstants.HIST_MSG.equalsIgnoreCase(entry.getKind())) {
+            String text = entry.getPayload();
+            if (ProtocolConstants.ENC_AES.equalsIgnoreCase(entry.getEncFlag())) {
+                try {
+                    text = CryptoIntegrityService.decryptAes(entry.getPayload(), session.aesKeyBase64);
+                } catch (Exception e) {
+                    text = "[AES Decryption Error]";
+                }
+            }
+            renderChatMessageCard(entry.getSender(), text, entry.getTimestamp(),
+                ProtocolConstants.ENC_AES.equalsIgnoreCase(entry.getEncFlag()), entry.getReplyRef(), true);
+
+        } else if (ProtocolConstants.HIST_LINK.equalsIgnoreCase(entry.getKind())) {
+            String[] f = DataPersistenceManager.split(entry.getPayload());
+            if (f.length >= 4) {
+                renderLinkPreviewCard(
+                    DataPersistenceManager.decodeField(f[0]),
+                    DataPersistenceManager.decodeField(f[1]),
+                    DataPersistenceManager.decodeField(f[2]),
+                    DataPersistenceManager.decodeField(f[3]));
+            }
+
+        } else if (ProtocolConstants.HIST_FILE.equalsIgnoreCase(entry.getKind())) {
+            String[] f = DataPersistenceManager.split(entry.getPayload());
+            if (f.length >= 4) {
+                renderFileVaultCard(currentRoom,
+                    DataPersistenceManager.decodeField(f[0]),
+                    Long.parseLong(f[1]),
+                    DataPersistenceManager.decodeField(f[2]),
+                    DataPersistenceManager.decodeField(f[3]));
+            }
+        }
+    }
+
+    /** Dispatches an incoming chat message: render, badge, mention alert. */
+    private void onChatArrived(String room, String sender, String text, String time, boolean isAes, String replyRef) {
+        boolean directMessage = room.startsWith("DM:");
+        if (directMessage || room.equalsIgnoreCase(currentRoom)) {
+            renderChatMessageCard(sender, text, time, isAes, replyRef, false);
+        } else {
+            Integer count = unreadByRoom.get(room);
+            unreadByRoom.put(room, (count == null ? 0 : count) + 1);
+            refreshRoomsList();
+        }
+
+        if (!sender.equalsIgnoreCase(session.username)) {
+            if (directMessage) {
+                ToastNotification.show(this, "Direct message from " + sender,
+                    stripToLength(text, 120), ToastNotification.Type.INFO);
+                Toolkit.getDefaultToolkit().beep();
+            } else if (mentionsMe(text)) {
+                ToastNotification.show(this, "Mentioned by " + sender,
+                    stripToLength(text, 120), ToastNotification.Type.INFO);
+                Toolkit.getDefaultToolkit().beep();
+            }
+        }
+    }
+
+    private boolean mentionsMe(String text) {
+        if (text == null || text.isEmpty()) return false;
+        String mention = "@" + session.username;
+        int idx = text.toLowerCase().indexOf(mention.toLowerCase());
+        if (idx < 0) return false;
+        int after = idx + mention.length();
+        return after >= text.length() || !Character.isLetterOrDigit(text.charAt(after));
+    }
+
+    private static String stripToLength(String text, int max) {
+        String flat = text.replace("\n", " ");
+        return flat.length() <= max ? flat : flat.substring(0, max) + "...";
+    }
+
+    private synchronized void sendNioFrame(String payload) {
         if (!connected || nioChannel == null || !nioChannel.isOpen()) return;
         try {
             ByteBuffer buf = framer.frameMessage(payload);
@@ -780,6 +1465,7 @@ public class MainHubFrame extends JFrame {
                 "Send Error",
                 e.getMessage()
             ));
+            handleDisconnected();
         }
     }
 
@@ -801,28 +1487,169 @@ public class MainHubFrame extends JFrame {
             }
         }
 
+        String replyWire = (pendingReply != null) ? pendingReply.toWire() : "";
+
         String cmd = ProtocolConstants.CMD_MSG + ProtocolConstants.DELIMITER +
-            currentRoom + ProtocolConstants.DELIMITER + encFlag + ProtocolConstants.DELIMITER + payloadToSend;
+            currentRoom + ProtocolConstants.DELIMITER + encFlag + ProtocolConstants.DELIMITER +
+            payloadToSend + ProtocolConstants.DELIMITER + replyWire;
 
         sendNioFrame(cmd);
         messageInput.setText("");
-        emitPresencePulse(ProtocolConstants.STATUS_ONLINE);
+        clearPendingReply();
+        emitPresencePulse(currentStatus);
     }
 
     private void switchRoom(String newRoom) {
         currentRoom = newRoom;
         currentRoomHeaderLabel.setText(newRoom);
-        currentRoomDescLabel.setText("Study discussions and resources for " + newRoom);
+        String topic = roomTopics.get(newRoom);
+        currentRoomTopicLabel.setText((topic == null || topic.isEmpty())
+            ? DataPersistenceManager.defaultRoomTopic(newRoom) : topic);
+
         chatFeedPanel.removeAll();
+        chatFeedPanel.add(chatFiller);
+        chatFeedPanel.revalidate();
+        chatFeedPanel.repaint();
+        messageCards.clear();
         lastSender = "";
         vaultModel.clear();
         allRoomFiles.clear();
 
+        // Entering a room clears its unread badge
+        unreadByRoom.remove(newRoom);
+        pinnedPayload = "";
+        pinnedBanner.setVisible(false);
         refreshRoomsList();
+        applyMessageSearch(activeSearchQuery);
 
         String cmd = ProtocolConstants.CMD_JOIN + ProtocolConstants.DELIMITER + newRoom;
         sendNioFrame(cmd);
-        emitPresencePulse(ProtocolConstants.STATUS_ONLINE);
+        emitPresencePulse(currentStatus);
+    }
+
+    // =========================================================================
+    // REPLY / QUOTE + MODERATOR PINNING
+    // =========================================================================
+    private void setPendingReply(String sender, String snippet, String time) {
+        pendingReply = new ReplyReference(sender, stripToLength(snippet, 70), time);
+        replyLabel.setText("<html>↪ Replying to <b style='color:#5865F2;'>" + escapeHtml(sender)
+            + "</b>: " + escapeHtml(pendingReply.snippet) + "</html>");
+        replyBanner.setVisible(true);
+        replyBanner.revalidate();
+        replyBanner.repaint();
+        messageInput.requestFocusInWindow();
+    }
+
+    private void clearPendingReply() {
+        pendingReply = null;
+        replyBanner.setVisible(false);
+        replyBanner.revalidate();
+        replyBanner.repaint();
+    }
+
+    private void pinMessage(String sender, String snippet, String time) {
+        String payload = DataPersistenceManager.encodeField(session.username)
+            + "|" + DataPersistenceManager.encodeField(time)
+            + "|" + DataPersistenceManager.encodeField(sender)
+            + "|" + DataPersistenceManager.encodeField(stripToLength(snippet, 160));
+        String cmd = ProtocolConstants.CMD_PIN + ProtocolConstants.DELIMITER + currentRoom
+            + ProtocolConstants.DELIMITER + payload;
+        sendNioFrame(cmd);
+    }
+
+    private void clearPinnedMessage() {
+        if (!ProtocolConstants.ROLE_MODERATOR.equalsIgnoreCase(session.role)) {
+            ToastNotification.show(this, "Moderators Only",
+                "Only moderators can unpin a room message.", ToastNotification.Type.WARNING);
+            return;
+        }
+        String cmd = ProtocolConstants.CMD_PIN + ProtocolConstants.DELIMITER + currentRoom
+            + ProtocolConstants.DELIMITER + "";
+        sendNioFrame(cmd);
+    }
+
+    private void showPinnedBanner(String payload) {
+        pinnedPayload = payload == null ? "" : payload;
+        if (pinnedPayload.isEmpty()) {
+            pinnedBanner.setVisible(false);
+            topBannerHost.revalidate();
+            topBannerHost.repaint();
+            return;
+        }
+        String[] f = DataPersistenceManager.split(pinnedPayload);
+        String by = f.length > 0 ? DataPersistenceManager.decodeField(f[0]) : "";
+        String time = f.length > 1 ? DataPersistenceManager.decodeField(f[1]) : "";
+        String sender = f.length > 2 ? DataPersistenceManager.decodeField(f[2]) : "";
+        String text = f.length > 3 ? DataPersistenceManager.decodeField(f[3]) : "";
+
+        pinnedLabel.setText("<html><b style='color:#F2F3F5;'>" + escapeHtml(sender) + "</b> "
+            + escapeHtml(text) + " <font color='#949BA4'>— pinned by " + escapeHtml(by)
+            + (time.isEmpty() ? "" : " at " + escapeHtml(time)) + "</font></html>");
+        pinnedBanner.setVisible(true);
+        topBannerHost.revalidate();
+        topBannerHost.repaint();
+    }
+
+    // =========================================================================
+    // CHAT SEARCH (Ctrl+F)
+    // =========================================================================
+    private void toggleMessageSearch(boolean visible) {
+        searchPanel.setVisible(visible);
+        if (visible) {
+            searchField.requestFocusInWindow();
+            searchField.selectAll();
+        } else {
+            searchField.setText("");
+            applyMessageSearch("");
+        }
+        searchPanel.revalidate();
+        searchPanel.repaint();
+    }
+
+    private void applyMessageSearch(String query) {
+        activeSearchQuery = query == null ? "" : query.trim();
+        int hits = 0;
+        for (MessageCard card : messageCards) {
+            boolean hit = card.applyHighlight(activeSearchQuery);
+            if (hit) hits++;
+        }
+        searchCountLabel.setText(activeSearchQuery.isEmpty() ? "" : hits + " match" + (hits == 1 ? "" : "es"));
+        chatFeedPanel.revalidate();
+        chatFeedPanel.repaint();
+    }
+
+    // =========================================================================
+    // VAULT SEARCH (FileSearchCallable on the concurrent engine)
+    // =========================================================================
+    private void scheduleVaultSearch() {
+        if (vaultSearchTimer == null) {
+            vaultSearchTimer = new Timer(150, e -> runVaultSearch());
+            vaultSearchTimer.setRepeats(false);
+        }
+        vaultSearchTimer.restart();
+    }
+
+    private void runVaultSearch() {
+        final String query = pendingVaultQuery;
+        final List<SharedFileRecord> snapshot = new ArrayList<>(allRoomFiles);
+        searchEngine.submit(() -> {
+            try {
+                Future<List<SharedFileRecord>> inner = searchEngine.submitFileSearch(snapshot, query, currentRoom);
+                final List<SharedFileRecord> matches = inner.get();
+                SwingUtilities.invokeLater(() -> {
+                    vaultModel.clear();
+                    for (SharedFileRecord record : matches) {
+                        vaultModel.addElement(record);
+                    }
+                });
+            } catch (Exception ignored) {}
+            return null;
+        });
+    }
+
+    private void refreshVaultModel() {
+        pendingVaultQuery = "";
+        runVaultSearch();
     }
 
     // =========================================================================
@@ -833,7 +1660,7 @@ public class MainHubFrame extends JFrame {
         if (typingDebounceTimer != null && typingDebounceTimer.isRunning()) {
             typingDebounceTimer.restart();
         } else {
-            typingDebounceTimer = new Timer(2500, e -> emitPresencePulse(ProtocolConstants.STATUS_ONLINE));
+            typingDebounceTimer = new Timer(2500, e -> emitPresencePulse(currentStatus));
             typingDebounceTimer.setRepeats(false);
             typingDebounceTimer.start();
         }
@@ -852,9 +1679,7 @@ public class MainHubFrame extends JFrame {
     }
 
     private void startPresenceHeartbeat() {
-        idlePulseTimer = new Timer(NetworkConfig.UDP_PULSE_INTERVAL_MS, e -> {
-            emitPresencePulse(ProtocolConstants.STATUS_ONLINE);
-        });
+        idlePulseTimer = new Timer(NetworkConfig.UDP_PULSE_INTERVAL_MS, e -> emitPresencePulse(currentStatus));
         idlePulseTimer.start();
     }
 
@@ -877,27 +1702,101 @@ public class MainHubFrame extends JFrame {
     }
 
     // =========================================================================
-    // TCP FILE VAULT & CHANNEL TRANSFERS (Port 9001)
+    // DRAG & DROP FILE SHARING (Port 9001)
+    // =========================================================================
+    private void installDropTarget(Component component) {
+        new DropTarget(component, new DropTargetAdapter() {
+            @Override
+            public void dragEnter(java.awt.dnd.DropTargetDragEvent dtde) {
+                component.setBackground(ThemeColors.BG_HOVER);
+                chatFeedPanel.setBackground(ThemeColors.BG_HOVER);
+                chatFeedPanel.repaint();
+            }
+
+            @Override
+            public void dragExit(java.awt.dnd.DropTargetEvent dte) {
+                component.setBackground(ThemeColors.BG_CHAT);
+                chatFeedPanel.setBackground(ThemeColors.BG_CHAT);
+                chatFeedPanel.repaint();
+            }
+
+            @Override
+            public void drop(DropTargetDropEvent event) {
+                component.setBackground(ThemeColors.BG_CHAT);
+                chatFeedPanel.setBackground(ThemeColors.BG_CHAT);
+                try {
+                    Transferable transferable = event.getTransferable();
+                    if (transferable.isDataFlavorSupported(DataFlavor.javaFileListFlavor)) {
+                        event.acceptDrop(DnDConstants.ACTION_COPY);
+                        @SuppressWarnings("unchecked")
+                        List<File> files = (List<File>) transferable.getTransferData(DataFlavor.javaFileListFlavor);
+                        event.dropComplete(true);
+                        if (files != null && !files.isEmpty()) {
+                            uploadFiles(files);
+                        }
+                    } else {
+                        event.rejectDrop();
+                    }
+                } catch (Exception e) {
+                    event.dropComplete(false);
+                }
+            }
+        });
+    }
+
+    // =========================================================================
+    // TCP FILE VAULT, UPLOADS & DOWNLOADS MANAGER (Port 9001)
     // =========================================================================
     private void chooseAndUploadFile() {
         JFileChooser chooser = new JFileChooser();
+        chooser.setMultiSelectionEnabled(true);
         int res = chooser.showOpenDialog(this);
         if (res == JFileChooser.APPROVE_OPTION) {
-            File selected = chooser.getSelectedFile();
-            boolean tamper = simulateTamperEnabled;
+            File[] selected = chooser.getSelectedFiles();
+            List<File> files = new ArrayList<>();
+            for (File f : selected) {
+                if (f.isFile()) files.add(f);
+            }
+            if (!files.isEmpty()) {
+                uploadFiles(files);
+            }
+        }
+    }
+
+    /** Uploads one or more files with a live progress card in the chat feed. */
+    private void uploadFiles(List<File> files) {
+        for (File file : files) {
+            // The card is built on the EDT (it may arrive from the drag & drop thread).
+            final TransferCard[] holder = new TransferCard[1];
+            runOnEdt(() -> {
+                holder[0] = new TransferCard(file.getName(), file.length(), true);
+                appendCard(holder[0]);
+            });
+            final TransferCard card = holder[0];
 
             new Thread(() -> {
-                FileTransferClient client = new FileTransferClient(session.host, session.filePort, session.sessionToken, inspectorPanel::logEvent);
-                FileTransferClient.TransferResult result = client.uploadFile(currentRoom, selected, tamper);
+                FileTransferClient client = new FileTransferClient(session.host, session.filePort,
+                    session.sessionToken, inspectorPanel::logEvent);
+                FileTransferClient.TransferResult result = client.uploadFile(currentRoom, file, simulateTamperEnabled,
+                    (transferred, total) -> {
+                        if (card != null) {
+                            SwingUtilities.invokeLater(() -> card.setProgress(transferred, total));
+                        }
+                    });
 
                 SwingUtilities.invokeLater(() -> {
+                    if (card == null) return;
                     if (result.success) {
+                        card.complete("☑ Uploaded & SHA-256 verified • stored as " + result.storedFilename,
+                            ThemeColors.STATUS_ONLINE);
                         ToastNotification.show(MainHubFrame.this, "File Upload Verified",
-                            selected.getName() + " saved to server vault.", ToastNotification.Type.SUCCESS);
+                            file.getName() + " saved to the server vault.", ToastNotification.Type.SUCCESS);
                     } else if (result.tampered) {
+                        card.complete("✖ TAMPER DETECTED — server rejected the file", ThemeColors.STATUS_DANGER);
                         ToastNotification.show(MainHubFrame.this, "TAMPER DETECTED",
                             "Server rejected upload! Computed: " + result.actualSha, ToastNotification.Type.ERROR);
                     } else {
+                        card.complete("✖ Upload failed: " + result.message, ThemeColors.STATUS_DANGER);
                         ToastNotification.show(MainHubFrame.this, "Upload Failed", result.message, ToastNotification.Type.ERROR);
                     }
                 });
@@ -905,16 +1804,49 @@ public class MainHubFrame extends JFrame {
         }
     }
 
-    private void downloadFile(String room, String filename) {
-        File dlDir = new File(NetworkConfig.DOWNLOADS_DIR);
+    private void downloadFile(String room, String filename, TransferCard card) {
+        File dir = FileTransferClient.getUserDownloadDir(session.username);
+        File destination = FileNameUtils.uniqueFile(dir, filename);
+
         new Thread(() -> {
-            FileTransferClient client = new FileTransferClient(session.host, session.filePort, session.sessionToken, inspectorPanel::logEvent);
-            FileTransferClient.TransferResult result = client.downloadFile(room, filename, dlDir);
+            FileTransferClient client = new FileTransferClient(session.host, session.filePort,
+                session.sessionToken, inspectorPanel::logEvent);
+            final FileTransferClient.TransferResult result = client.downloadToFile(room, filename, destination,
+                (transferred, total) -> {
+                    if (card != null) {
+                        SwingUtilities.invokeLater(() -> card.setProgress(transferred, total));
+                    }
+                });
 
             SwingUtilities.invokeLater(() -> {
                 if (result.success) {
+                    if (card != null) {
+                        card.complete("☑ Saved to downloads/" + session.username + "/"
+                            + result.savedFile.getName(), ThemeColors.STATUS_ONLINE);
+                        card.enableOpenActions(result.savedFile);
+                    }
                     ToastNotification.show(MainHubFrame.this, "Download Complete",
                         "Saved to " + result.savedFile.getAbsolutePath(), ToastNotification.Type.SUCCESS);
+                } else {
+                    if (card != null) {
+                        card.complete("✖ Download failed: " + result.message, ThemeColors.STATUS_DANGER);
+                    }
+                    ToastNotification.show(MainHubFrame.this, "Download Failed", result.message, ToastNotification.Type.ERROR);
+                }
+            });
+        }, "File-Downloader").start();
+    }
+
+    private void downloadAndOpen(String room, String filename) {
+        File dir = FileTransferClient.getUserDownloadDir(session.username);
+        File destination = FileNameUtils.uniqueFile(dir, filename);
+        new Thread(() -> {
+            FileTransferClient client = new FileTransferClient(session.host, session.filePort,
+                session.sessionToken, inspectorPanel::logEvent);
+            final FileTransferClient.TransferResult result = client.downloadToFile(room, filename, destination, null);
+            SwingUtilities.invokeLater(() -> {
+                if (result.success) {
+                    openFile(result.savedFile);
                 } else {
                     ToastNotification.show(MainHubFrame.this, "Download Failed", result.message, ToastNotification.Type.ERROR);
                 }
@@ -922,90 +1854,237 @@ public class MainHubFrame extends JFrame {
         }, "File-Downloader").start();
     }
 
-    private void filterVaultFiles(String query) {
-        vaultModel.clear();
-        String q = query.toLowerCase();
-        for (SharedFileRecord r : allRoomFiles) {
-            if (q.isEmpty() || r.getFilename().toLowerCase().contains(q) || r.getUploader().toLowerCase().contains(q)) {
-                vaultModel.addElement(r);
+    private void openFile(File file) {
+        try {
+            if (Desktop.isDesktopSupported()) {
+                Desktop.getDesktop().open(file);
+            } else {
+                ToastNotification.show(this, "Open File", file.getAbsolutePath(), ToastNotification.Type.INFO);
             }
+        } catch (Exception e) {
+            ToastNotification.show(this, "Open Failed", e.getMessage(), ToastNotification.Type.ERROR);
+        }
+    }
+
+    private void openDownloadsFolder() {
+        try {
+            File dir = FileTransferClient.getUserDownloadDir(session.username);
+            if (!dir.exists()) dir.mkdirs();
+            if (Desktop.isDesktopSupported()) {
+                Desktop.getDesktop().open(dir);
+            } else {
+                ToastNotification.show(this, "Downloads Folder", dir.getAbsolutePath(), ToastNotification.Type.INFO);
+            }
+        } catch (Exception e) {
+            ToastNotification.show(this, "Open Failed", e.getMessage(), ToastNotification.Type.ERROR);
         }
     }
 
     // =========================================================================
     // RICH MESSAGE CARDS & JAVA2D RENDERING
     // =========================================================================
-    private void renderChatMessageCard(String sender, String message, String time, boolean isAes) {
-        boolean isConsecutive = sender.equalsIgnoreCase(lastSender);
-        lastSender = sender;
 
-        JPanel card = new JPanel(new BorderLayout(12, 4));
-        card.setBackground(ThemeColors.BG_CHAT);
-        card.setBorder(BorderFactory.createEmptyBorder(isConsecutive ? 2 : 8, 8, 2, 8));
-        card.setMaximumSize(new Dimension(Integer.MAX_VALUE, 200));
+    /**
+     * A single chat bubble: avatar + author row + text, with hover actions for
+     * Reply / Pin to Room and Ctrl+F hit highlighting.
+     */
+    private class MessageCard extends JPanel {
 
-        if (!isConsecutive) {
-            AvatarComponent avatar = new AvatarComponent(sender, 38, null, false);
-            card.add(avatar, BorderLayout.WEST);
+        private static final long serialVersionUID = 1L;
+        private final String sender;
+        private final String text;
+        private final String time;
+        private final boolean aes;
+        private final ReplyReference reply;
+        private final JLabel textLabel;
+        private final JPanel actionBox;
+
+        MessageCard(String sender, String text, String time, boolean aes, ReplyReference reply, boolean consecutive) {
+            this.sender = sender;
+            this.text = text;
+            this.time = time;
+            this.aes = aes;
+            this.reply = reply;
+
+            setLayout(new BorderLayout(12, 4));
+            setBackground(ThemeColors.BG_CHAT);
+            setBorder(BorderFactory.createEmptyBorder(consecutive ? 2 : 8, 8, 2, 8));
+            setMaximumSize(new Dimension(Integer.MAX_VALUE, 420));
 
             JPanel contentBox = new JPanel();
             contentBox.setLayout(new BoxLayout(contentBox, BoxLayout.Y_AXIS));
             contentBox.setOpaque(false);
 
-            JPanel metaRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
-            metaRow.setOpaque(false);
+            if (!consecutive) {
+                AvatarComponent avatar = new AvatarComponent(sender, 38, null, false);
+                add(avatar, BorderLayout.WEST);
 
-            JLabel nameLbl = new JLabel(sender);
-            nameLbl.setFont(ThemeColors.FONT_BOLD);
-            nameLbl.setForeground(sender.equalsIgnoreCase(session.username) ? ThemeColors.ACCENT_PRIMARY : ThemeColors.TEXT_PRIMARY);
+                JPanel metaRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+                metaRow.setOpaque(false);
 
-            String role = sender.equalsIgnoreCase("admin") ? "MOD" : "STUDENT";
-            JLabel roleTag = new JLabel(" " + role + " ");
-            roleTag.setFont(new Font("Segoe UI", Font.BOLD, 9));
-            roleTag.setForeground(ThemeColors.TEXT_DARK);
-            roleTag.setOpaque(true);
-            roleTag.setBackground(role.equals("MOD") ? ThemeColors.BADGE_MOD : ThemeColors.BADGE_STUDENT);
+                JLabel nameLbl = new JLabel(sender);
+                nameLbl.setFont(ThemeColors.FONT_BOLD);
+                nameLbl.setForeground(sender.equalsIgnoreCase(session.username) ? ThemeColors.ACCENT_PRIMARY : ThemeColors.TEXT_PRIMARY);
 
-            JLabel timeLbl = new JLabel(time);
-            timeLbl.setFont(ThemeColors.FONT_MUTED);
-            timeLbl.setForeground(ThemeColors.TEXT_MUTED);
+                String role = sender.equalsIgnoreCase("admin") ? "MOD" : "STUDENT";
+                JLabel roleTag = new JLabel(" " + role + " ");
+                roleTag.setFont(new Font("Segoe UI", Font.BOLD, 9));
+                roleTag.setForeground(ThemeColors.TEXT_DARK);
+                roleTag.setOpaque(true);
+                roleTag.setBackground(role.equals("MOD") ? ThemeColors.BADGE_MOD : ThemeColors.BADGE_STUDENT);
 
-            metaRow.add(nameLbl);
-            metaRow.add(roleTag);
-            metaRow.add(timeLbl);
+                JLabel timeLbl = new JLabel(time);
+                timeLbl.setFont(ThemeColors.FONT_MUTED);
+                timeLbl.setForeground(ThemeColors.TEXT_MUTED);
 
-            if (isAes) {
-                JLabel aesPill = new JLabel(" 🔒 AES-128 ");
-                aesPill.setFont(new Font("Segoe UI", Font.BOLD, 9));
-                aesPill.setForeground(ThemeColors.STATUS_ONLINE);
-                aesPill.setOpaque(true);
-                aesPill.setBackground(ThemeColors.BG_INPUT);
-                metaRow.add(aesPill);
+                metaRow.add(nameLbl);
+                metaRow.add(roleTag);
+                metaRow.add(timeLbl);
+
+                if (aes) {
+                    JLabel aesPill = new JLabel(" 🔒 AES-128 ");
+                    aesPill.setFont(new Font("Segoe UI", Font.BOLD, 9));
+                    aesPill.setForeground(ThemeColors.STATUS_ONLINE);
+                    aesPill.setOpaque(true);
+                    aesPill.setBackground(ThemeColors.BG_INPUT);
+                    metaRow.add(aesPill);
+                }
+
+                // Hover actions (Reply / Pin)
+                actionBox = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+                actionBox.setOpaque(false);
+                actionBox.setVisible(false);
+
+                JButton replyBtn = new JButton("Reply");
+                styleHoverAction(replyBtn);
+                replyBtn.addActionListener(e -> setPendingReply(sender, text, time));
+
+                JButton pinBtn = new JButton("Pin to Room");
+                styleHoverAction(pinBtn);
+                pinBtn.addActionListener(e -> pinMessage(sender, text, time));
+
+                actionBox.add(replyBtn);
+                actionBox.add(pinBtn);
+                metaRow.add(actionBox);
+
+                contentBox.add(metaRow);
+
+                if (reply != null) {
+                    contentBox.add(Box.createVerticalStrut(2));
+                    JLabel quoteLbl = new JLabel("<html><div style='border-left:3px solid #5865F2; padding-left:8px; color:#949BA4;'>"
+                        + "<b style='color:#5865F2;'>" + escapeHtml(reply.sender) + "</b> "
+                        + escapeHtml(reply.snippet) + "</div></html>");
+                    quoteLbl.setFont(ThemeColors.FONT_MUTED);
+                    quoteLbl.setBorder(BorderFactory.createEmptyBorder(2, 4, 2, 4));
+                    contentBox.add(quoteLbl);
+                }
+            } else {
+                actionBox = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+                actionBox.setOpaque(false);
+                actionBox.setVisible(false);
+
+                JPanel indentBox = new JPanel(new BorderLayout());
+                indentBox.setOpaque(false);
+                indentBox.setBorder(BorderFactory.createEmptyBorder(0, 50, 0, 0));
+                textLabel = new JLabel();
+                indentBox.add(textLabel, BorderLayout.CENTER);
+                add(indentBox, BorderLayout.CENTER);
+                installInteractions();
+                applyTooltip();
+                renderText("");
+                return;
             }
 
-            JLabel textLbl = new JLabel("<html><body style='width: 580px; color: #f2f3f5; font-family: Segoe UI; font-size: 13px;'>" +
-                escapeHtml(message) + "</body></html>");
-
-            contentBox.add(metaRow);
+            textLabel = new JLabel();
             contentBox.add(Box.createVerticalStrut(3));
-            contentBox.add(textLbl);
+            contentBox.add(textLabel);
+            add(contentBox, BorderLayout.CENTER);
 
-            card.add(contentBox, BorderLayout.CENTER);
-        } else {
-            // Indent consecutive messages
-            JPanel indentBox = new JPanel(new BorderLayout());
-            indentBox.setOpaque(false);
-            indentBox.setBorder(BorderFactory.createEmptyBorder(0, 50, 0, 0));
-
-            JLabel textLbl = new JLabel("<html><body style='width: 580px; color: #f2f3f5; font-family: Segoe UI; font-size: 13px;'>" +
-                escapeHtml(message) + "</body></html>");
-            indentBox.add(textLbl, BorderLayout.CENTER);
-            card.add(indentBox, BorderLayout.CENTER);
+            installInteractions();
+            applyTooltip();
+            renderText("");
         }
 
-        chatFeedPanel.add(card);
-        chatFeedPanel.revalidate();
-        scrollToBottom();
+        private void applyTooltip() {
+            setToolTipText(sender + " \u2022 " + time
+                + (aes ? " \u2022 AES-128 encrypted" : " \u2022 plaintext")
+                + (reply != null ? " \u2022 reply to " + reply.sender : ""));
+        }
+
+        private void styleHoverAction(JButton button) {
+            button.setFont(ThemeColors.FONT_MUTED);
+            button.setForeground(ThemeColors.TEXT_MUTED);
+            button.setContentAreaFilled(false);
+            button.setBorderPainted(false);
+            button.setFocusPainted(false);
+            button.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        }
+
+        private void installInteractions() {
+            addMouseListener(new MouseAdapter() {
+                @Override
+                public void mouseEntered(MouseEvent e) {
+                    actionBox.setVisible(true);
+                    setBackground(ThemeColors.BG_CARD);
+                    revalidate();
+                    repaint();
+                }
+
+                @Override
+                public void mouseExited(MouseEvent e) {
+                    actionBox.setVisible(false);
+                    setBackground(ThemeColors.BG_CHAT);
+                    revalidate();
+                    repaint();
+                }
+
+                @Override
+                public void mousePressed(MouseEvent e) {
+                    maybeShowPopup(e);
+                }
+
+                @Override
+                public void mouseReleased(MouseEvent e) {
+                    maybeShowPopup(e);
+                }
+            });
+        }
+
+        private void maybeShowPopup(MouseEvent e) {
+            if (!e.isPopupTrigger()) return;
+            JPopupMenu menu = new JPopupMenu();
+            JMenuItem replyItem = new JMenuItem("Reply to " + sender);
+            replyItem.addActionListener(ev -> setPendingReply(sender, text, time));
+            JMenuItem pinItem = new JMenuItem("Pin to Room");
+            pinItem.addActionListener(ev -> pinMessage(sender, text, time));
+            menu.add(replyItem);
+            menu.add(pinItem);
+            menu.show(e.getComponent(), e.getX(), e.getY());
+        }
+
+        private void renderText(String query) {
+            textLabel.setText("<html><body style='width: 560px; color: #f2f3f5; font-family: Segoe UI; font-size: 13px;'>"
+                + highlightHtml(text, query) + "</body></html>");
+        }
+
+        /** Applies the Ctrl+F query; returns true when this card contains a hit. */
+        boolean applyHighlight(String query) {
+            boolean hit = !query.isEmpty() && text != null && text.toLowerCase().contains(query.toLowerCase());
+            renderText(query);
+            return hit;
+        }
+    }
+
+    private void renderChatMessageCard(String sender, String message, String time, boolean isAes,
+                                       String replyWire, boolean fromHistory) {
+        boolean isConsecutive = !fromHistory && sender.equalsIgnoreCase(lastSender);
+        lastSender = sender;
+
+        ReplyReference reply = ReplyReference.fromWire(replyWire);
+        MessageCard card = new MessageCard(sender, message, time, isAes, reply, isConsecutive);
+        card.applyHighlight(activeSearchQuery);
+        messageCards.add(card);
+        appendCard(card);
     }
 
     private void renderLinkPreviewCard(String rawUrl, String hostIp, String status, String title) {
@@ -1056,61 +2135,51 @@ public class MainHubFrame extends JFrame {
         card.add(titleLbl, BorderLayout.CENTER);
         card.add(urlLbl, BorderLayout.SOUTH);
 
-        chatFeedPanel.add(card);
-        chatFeedPanel.revalidate();
-        scrollToBottom();
+        appendCard(card);
     }
 
     private void renderFileVaultCard(String room, String filename, long size, String uploader, String sha256) {
-        RoundedPanel card = new RoundedPanel(10, ThemeColors.BG_CARD, ThemeColors.STATUS_ONLINE, 1);
-        card.setLayout(new BorderLayout(12, 0));
-        card.setMaximumSize(new Dimension(Integer.MAX_VALUE, 75));
-        card.setBorder(BorderFactory.createCompoundBorder(
-            BorderFactory.createEmptyBorder(4, 50, 4, 16),
-            BorderFactory.createEmptyBorder(8, 14, 8, 14)
-        ));
+        TransferCard card = new TransferCard(filename, size, false);
+        card.showFileDetails(uploader, sha256);
+        card.enableDownload(() -> downloadFile(room, filename, card));
 
-        JLabel iconLbl = new JLabel("📄");
-        iconLbl.setFont(new Font("Segoe UI", Font.PLAIN, 28));
-
-        JPanel infoPanel = new JPanel();
-        infoPanel.setLayout(new BoxLayout(infoPanel, BoxLayout.Y_AXIS));
-        infoPanel.setOpaque(false);
-
-        String sizeStr = (size < 1024) ? size + " B" : String.format("%.1f KB", size / 1024.0);
-        JLabel nameLbl = new JLabel(filename + " (" + sizeStr + ")");
-        nameLbl.setFont(ThemeColors.FONT_HEADER);
-        nameLbl.setForeground(ThemeColors.TEXT_PRIMARY);
-
-        JLabel shaLbl = new JLabel("SHA-256: " + sha256 + " • Uploaded by " + uploader);
-        shaLbl.setFont(ThemeColors.FONT_MUTED);
-        shaLbl.setForeground(ThemeColors.TEXT_MUTED);
-
-        infoPanel.add(nameLbl);
-        infoPanel.add(Box.createVerticalStrut(2));
-        infoPanel.add(shaLbl);
-
-        PillButton dlBtn = new PillButton("Download", ThemeColors.STATUS_ONLINE, ThemeColors.STATUS_ONLINE.darker(), ThemeColors.TEXT_PRIMARY, 14);
-        dlBtn.setPreferredSize(new Dimension(100, 32));
-        dlBtn.addActionListener(e -> downloadFile(room, filename));
-
-        card.add(iconLbl, BorderLayout.WEST);
-        card.add(infoPanel, BorderLayout.CENTER);
-        card.add(dlBtn, BorderLayout.EAST);
-
-        chatFeedPanel.add(card);
-        chatFeedPanel.revalidate();
-        scrollToBottom();
+        // Offer "Open File" straight away when the file is already in this user's downloads folder.
+        File local = new File(FileTransferClient.getUserDownloadDir(session.username), filename);
+        if (local.exists()) {
+            card.enableOpenActions(local);
+        }
+        appendCard(card);
     }
 
     private void renderSystemNotice(String text) {
         JPanel notice = new JPanel(new FlowLayout(FlowLayout.CENTER));
         notice.setOpaque(false);
+        notice.setMaximumSize(new Dimension(Integer.MAX_VALUE, 26));
         JLabel l = new JLabel("— " + text + " —");
         l.setFont(ThemeColors.FONT_MUTED);
         l.setForeground(ThemeColors.TEXT_MUTED);
         notice.add(l);
-        chatFeedPanel.add(notice);
+        appendCard(notice);
+    }
+
+    /** Runs {@code action} on the Swing event dispatch thread, waiting when called off-EDT. */
+    private static void runOnEdt(Runnable action) {
+        if (SwingUtilities.isEventDispatchThread()) {
+            action.run();
+            return;
+        }
+        try {
+            SwingUtilities.invokeAndWait(action);
+        } catch (Exception e) {
+            SwingUtilities.invokeLater(action);
+        }
+    }
+
+    /** Adds a card just above the bottom glue so cards keep their natural height. */
+    private void appendCard(JComponent card) {
+        chatFeedPanel.remove(chatFiller);
+        chatFeedPanel.add(card);
+        chatFeedPanel.add(chatFiller);
         chatFeedPanel.revalidate();
         scrollToBottom();
     }
@@ -1122,11 +2191,159 @@ public class MainHubFrame extends JFrame {
         });
     }
 
+    private String highlightHtml(String text, String query) {
+        String escaped = escapeHtml(text).replace("\n", "<br/>");
+        if (query == null || query.isEmpty()) return escaped;
+        return escaped.replaceAll("(?i)" + Pattern.quote(escapeHtml(query)),
+            "<span style='background-color:#F0B232;color:#111214;'>$0</span>");
+    }
+
     private String escapeHtml(String text) {
         if (text == null) return "";
         return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
     }
 
+    // =========================================================================
+    // FILE / TRANSFER CARD WITH LIVE PROGRESS
+    // =========================================================================
+    private class TransferCard extends RoundedPanel {
+
+        private static final long serialVersionUID = 1L;
+        private final JLabel statusLabel = new JLabel(" ");
+        private final JProgressBar progressBar = new JProgressBar(0, 100);
+        private final JButton actionBtn = new JButton("Download");
+        private final JButton openBtn = new JButton("Open File");
+        private File localFile;
+
+        TransferCard(String filename, long size, boolean upload) {
+            super(10, ThemeColors.BG_CARD, ThemeColors.STATUS_ONLINE, 1);
+            setLayout(new BorderLayout(12, 0));
+            setMaximumSize(new Dimension(Integer.MAX_VALUE, 92));
+            setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createEmptyBorder(4, 50, 4, 16),
+                BorderFactory.createEmptyBorder(8, 14, 8, 14)
+            ));
+
+            JLabel iconLbl = new JLabel("📄");
+            iconLbl.setFont(new Font("Segoe UI", Font.PLAIN, 28));
+
+            JPanel infoPanel = new JPanel();
+            infoPanel.setLayout(new BoxLayout(infoPanel, BoxLayout.Y_AXIS));
+            infoPanel.setOpaque(false);
+
+            String sizeStr = (size < 1024) ? size + " B" : String.format("%.1f KB", size / 1024.0);
+            JLabel nameLbl = new JLabel(filename + " (" + sizeStr + ")");
+            nameLbl.setFont(ThemeColors.FONT_HEADER);
+            nameLbl.setForeground(ThemeColors.TEXT_PRIMARY);
+
+            statusLabel.setFont(ThemeColors.FONT_MUTED);
+            statusLabel.setForeground(ThemeColors.TEXT_MUTED);
+            statusLabel.setText(upload ? "⬆ Uploading over TCP FileChannel..." : "Shared in this room");
+
+            progressBar.setStringPainted(true);
+            progressBar.setFont(ThemeColors.FONT_MUTED);
+            progressBar.setForeground(ThemeColors.STATUS_ONLINE);
+            progressBar.setBackground(ThemeColors.BG_INPUT);
+            progressBar.setPreferredSize(new Dimension(150, 14));
+            progressBar.setValue(0);
+            progressBar.setVisible(upload);
+
+            infoPanel.add(nameLbl);
+            infoPanel.add(Box.createVerticalStrut(2));
+            infoPanel.add(statusLabel);
+            infoPanel.add(Box.createVerticalStrut(3));
+            infoPanel.add(progressBar);
+
+            JPanel buttonBox = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
+            buttonBox.setOpaque(false);
+            actionBtn.setFont(ThemeColors.FONT_BOLD);
+            actionBtn.setForeground(ThemeColors.TEXT_PRIMARY);
+            actionBtn.setBackground(ThemeColors.STATUS_ONLINE);
+            actionBtn.setBorderPainted(false);
+            actionBtn.setFocusPainted(false);
+            actionBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            actionBtn.setPreferredSize(new Dimension(100, 30));
+            actionBtn.setVisible(!upload);
+
+            openBtn.setFont(ThemeColors.FONT_BOLD);
+            openBtn.setForeground(ThemeColors.TEXT_MUTED);
+            openBtn.setBackground(ThemeColors.BG_INPUT);
+            openBtn.setBorderPainted(false);
+            openBtn.setFocusPainted(false);
+            openBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            openBtn.setPreferredSize(new Dimension(96, 30));
+            openBtn.setVisible(false);
+
+            buttonBox.add(openBtn);
+            buttonBox.add(actionBtn);
+
+            add(iconLbl, BorderLayout.WEST);
+            add(infoPanel, BorderLayout.CENTER);
+            add(buttonBox, BorderLayout.EAST);
+        }
+
+        void enableDownload(Runnable action) {
+            actionBtn.addActionListener(e -> {
+                actionBtn.setEnabled(false);
+                progressBar.setVisible(true);
+                statusLabel.setText("⬇ Downloading over TCP FileChannel...");
+                action.run();
+            });
+        }
+
+        void showFileDetails(String uploader, String sha256) {
+            String shortSha = sha256.length() > 16 ? sha256.substring(0, 16) + "…" : sha256;
+            statusLabel.setText("SHA-256: " + shortSha + " • Uploaded by " + uploader);
+        }
+
+        void setProgress(long transferred, long total) {
+            int pct = total <= 0 ? 0 : (int) Math.min(100, (transferred * 100) / total);
+            progressBar.setValue(pct);
+            progressBar.setString(pct + "%  (" + (transferred / 1024) + " KB / " + Math.max(1, total / 1024) + " KB)");
+        }
+
+        void complete(String message, Color color) {
+            progressBar.setVisible(false);
+            statusLabel.setText(message);
+            statusLabel.setForeground(color);
+            setBorderColor(color);
+            revalidate();
+            repaint();
+        }
+
+        void enableOpenActions(File file) {
+            this.localFile = file;
+            openBtn.setVisible(true);
+            openBtn.addActionListener(e -> {
+                if (localFile != null) {
+                    openFile(localFile);
+                }
+            });
+            revalidate();
+            repaint();
+        }
+    }
+
+    // =========================================================================
+    // SWITCH USER / LOG OUT
+    // =========================================================================
+    private void switchUser() {
+        int choice = JOptionPane.showConfirmDialog(this,
+            "Log out of '" + session.username + "' and switch to another account?",
+            "Switch User / Log Out", JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE);
+
+        if (choice != JOptionPane.YES_OPTION) {
+            return;
+        }
+
+        shutdownNetworking();
+        dispose();
+        StudyHubClientMain.launchSession(inspectorPanel);
+    }
+
+    // =========================================================================
+    // TLS CERTIFICATE DIALOG
+    // =========================================================================
     private void showTlsCertDialog() {
         TlsAuthClient.CertificateDetails cert = session.certificateDetails;
         if (cert == null) return;
@@ -1180,9 +2397,12 @@ public class MainHubFrame extends JFrame {
     // CUSTOM RENDERERS FOR SIDEBARS
     // =========================================================================
     private static class MemberCellRenderer extends JPanel implements ListCellRenderer<MemberItem> {
+
+        private static final long serialVersionUID = 1L;
         private final AvatarComponent avatar = new AvatarComponent("?", 28);
         private final JLabel nameLbl = new JLabel();
         private final JLabel roleLbl = new JLabel();
+        private final JLabel statusLbl = new JLabel();
 
         public MemberCellRenderer() {
             setLayout(new BorderLayout(8, 0));
@@ -1191,14 +2411,24 @@ public class MainHubFrame extends JFrame {
 
             nameLbl.setFont(ThemeColors.FONT_HEADER);
             roleLbl.setFont(new Font("Segoe UI", Font.BOLD, 9));
+            statusLbl.setFont(ThemeColors.FONT_MUTED);
 
             JPanel textP = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
             textP.setOpaque(false);
             textP.add(nameLbl);
             textP.add(roleLbl);
 
+            JPanel south = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+            south.setOpaque(false);
+            south.add(statusLbl);
+
+            JPanel center = new JPanel(new BorderLayout());
+            center.setOpaque(false);
+            center.add(textP, BorderLayout.NORTH);
+            center.add(south, BorderLayout.SOUTH);
+
             add(avatar, BorderLayout.WEST);
-            add(textP, BorderLayout.CENTER);
+            add(center, BorderLayout.CENTER);
         }
 
         @Override
@@ -1207,8 +2437,23 @@ public class MainHubFrame extends JFrame {
             nameLbl.setText(item.username);
             nameLbl.setForeground(ThemeColors.TEXT_PRIMARY);
 
-            Color dotColor = ProtocolConstants.STATUS_TYPING.equalsIgnoreCase(item.status) ? ThemeColors.STATUS_TYPING : ThemeColors.STATUS_ONLINE;
+            Color dotColor;
+            if (ProtocolConstants.STATUS_TYPING.equalsIgnoreCase(item.status)) {
+                dotColor = ThemeColors.STATUS_TYPING;
+            } else if (ProtocolConstants.STATUS_FOCUS.equalsIgnoreCase(item.status)
+                || ProtocolConstants.STATUS_LAB.equalsIgnoreCase(item.status)) {
+                dotColor = ThemeColors.BADGE_MOD;
+            } else {
+                dotColor = ThemeColors.STATUS_ONLINE;
+            }
             avatar.setStatusColor(dotColor);
+
+            boolean customStatus = ProtocolConstants.STATUS_FOCUS.equalsIgnoreCase(item.status)
+                || ProtocolConstants.STATUS_LAB.equalsIgnoreCase(item.status)
+                || ProtocolConstants.STATUS_AVAILABLE.equalsIgnoreCase(item.status)
+                || ProtocolConstants.STATUS_IDLE.equalsIgnoreCase(item.status);
+            statusLbl.setText(customStatus ? ProtocolConstants.describeStatus(item.status) : "");
+            statusLbl.setForeground(ThemeColors.TEXT_MUTED);
 
             if (ProtocolConstants.ROLE_MODERATOR.equalsIgnoreCase(item.role)) {
                 roleLbl.setText("MOD");
@@ -1222,6 +2467,8 @@ public class MainHubFrame extends JFrame {
     }
 
     private class VaultCellRenderer extends JPanel implements ListCellRenderer<SharedFileRecord> {
+
+        private static final long serialVersionUID = 1L;
         private final JLabel nameLbl = new JLabel();
         private final JLabel metaLbl = new JLabel();
 
@@ -1244,7 +2491,10 @@ public class MainHubFrame extends JFrame {
         public Component getListCellRendererComponent(JList<? extends SharedFileRecord> list, SharedFileRecord record, int index, boolean isSelected, boolean cellHasFocus) {
             setBackground(isSelected ? ThemeColors.BG_HOVER : ThemeColors.BG_PANEL);
             nameLbl.setText("📄 " + record.getFilename());
-            metaLbl.setText(record.getFormattedSize() + " • " + record.getUploader());
+            metaLbl.setText(record.getFormattedSize() + " • " + record.getUploader() + " • " + record.getTimestamp());
+            String ext = record.getExtension();
+            setToolTipText("Click to download • Double-click to download and open"
+                + (ext.isEmpty() ? "" : " • Type: ." + ext));
             return this;
         }
     }
