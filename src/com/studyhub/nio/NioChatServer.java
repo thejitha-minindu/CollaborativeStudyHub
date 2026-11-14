@@ -1,15 +1,16 @@
 package com.studyhub.nio;
 
+import com.studyhub.common.DataPersistenceManager;
 import com.studyhub.common.NetworkConfig;
 import com.studyhub.common.PacketLogEvent;
 import com.studyhub.common.ProtocolConstants;
 import com.studyhub.concurrent.ResourceConcurrentEngine;
 import com.studyhub.concurrent.SafeRoomRegistry;
+import com.studyhub.transfer.SharedFileRecord;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.StandardSocketOptions;
 import java.nio.ByteBuffer;
-import java.nio.channels.ClosedChannelException;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
@@ -29,14 +30,19 @@ import java.util.regex.Pattern;
  * [MEMBER 1: Java NIO Non-Blocking Multiplexing]
  * Non-blocking multiplexed chat and event coordination server.
  * Operates a single-threaded Selector event loop on Port 9000 for OP_ACCEPT, OP_READ, and OP_WRITE.
+ *
+ * <p>Every accepted frame is additionally journalled to the disk persistence engine, and each
+ * successful {@code JOIN} replays the last {@value NetworkConfig#HISTORY_REPLAY_LIMIT} persisted
+ * messages over the same {@link SocketChannel} so late joiners land in a fully populated room.</p>
  */
 public class NioChatServer {
 
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm:ss");
-    private static final Pattern URL_PATTERN = Pattern.compile("https?://[\\w\\-\\.\\~:/?#\\[\\]@!$&'()*+,;=%]+", Pattern.CASE_INSENSITIVE);
+    private static final Pattern URL_PATTERN = Pattern.compile("https?://[\\w\\-\\.~:/?#\\[\\]@!$&'()*+,;=%]+", Pattern.CASE_INSENSITIVE);
 
     private final int port;
     private final SafeRoomRegistry registry;
+    private final DataPersistenceManager persistence;
     private final ResourceConcurrentEngine concurrentEngine;
     private final Consumer<PacketLogEvent> telemetrySink;
     private final MessageFramer framer = new MessageFramer();
@@ -56,6 +62,7 @@ public class NioChatServer {
     public NioChatServer(int port, SafeRoomRegistry registry, ResourceConcurrentEngine concurrentEngine, Consumer<PacketLogEvent> telemetrySink) {
         this.port = port;
         this.registry = registry;
+        this.persistence = registry != null ? registry.getPersistence() : DataPersistenceManager.getInstance();
         this.concurrentEngine = concurrentEngine;
         this.telemetrySink = telemetrySink != null ? telemetrySink : e -> {};
     }
@@ -80,7 +87,7 @@ public class NioChatServer {
             PacketLogEvent.Module.NIO_SELECTOR,
             PacketLogEvent.Direction.INTERNAL,
             "NIO Selector Started",
-            "Single-threaded event loop bound to Port " + port + " (OP_ACCEPT registered)"
+            "Single-threaded event loop bound to Port " + port + " (OP_ACCEPT registered) | History replay enabled"
         ));
     }
 
@@ -206,7 +213,7 @@ public class NioChatServer {
     }
 
     private void processInboundFrame(ClientChannelContext ctx, String frame) {
-        String[] parts = frame.split(ProtocolConstants.DELIMITER_REGEX);
+        String[] parts = frame.split(ProtocolConstants.DELIMITER_REGEX, -1);
         if (parts.length == 0) return;
 
         String cmd = parts[0];
@@ -223,11 +230,19 @@ public class NioChatServer {
                         ctx.setSessionToken(token);
                         ctx.setCurrentRoom(session.getCurrentRoom());
                         ctx.setAuthenticated(true);
+                        ctx.setRole(session.getRole());
 
                         contextsByUsername.put(session.getUsername().toLowerCase(), ctx);
 
                         sendDirectMessage(ctx, ProtocolConstants.EVT_SYSTEM + ProtocolConstants.DELIMITER +
-                            "Welcome to StudyHub, " + session.getUsername() + "! Role: " + session.getRole());
+                            "Welcome back to StudyHub, " + session.getDisplayName() + "! Role: " + session.getRole());
+
+                        // Hand the client the full workspace snapshot: rooms, pinned banner,
+                        // last 50 persisted messages and every file already in the room vault.
+                        sendRoomList(ctx);
+                        sendPinnedMessage(ctx, session.getCurrentRoom());
+                        sendHistoryBatch(ctx, session.getCurrentRoom());
+                        sendVaultList(ctx, session.getCurrentRoom());
 
                         broadcastUserList(session.getCurrentRoom());
                     } else {
@@ -246,7 +261,68 @@ public class NioChatServer {
                     broadcastUserList(oldRoom);
                     broadcastUserList(newRoom);
 
-                    sendDirectMessage(ctx, ProtocolConstants.EVT_SYSTEM + ProtocolConstants.DELIMITER + "Joined room " + newRoom);
+                    // Late joiner bootstrap: pinned banner + persisted transcript + vault index
+                    sendPinnedMessage(ctx, newRoom);
+                    sendHistoryBatch(ctx, newRoom);
+                    sendVaultList(ctx, newRoom);
+
+                    sendDirectMessage(ctx, ProtocolConstants.EVT_SYSTEM + ProtocolConstants.DELIMITER + "Joined room " + newRoom
+                        + ". Replaying last " + NetworkConfig.HISTORY_REPLAY_LIMIT + " messages.");
+                }
+                break;
+
+            case ProtocolConstants.CMD_HISTORY:
+                if (parts.length >= 2 && ctx.isAuthenticated()) {
+                    sendHistoryBatch(ctx, parts[1].trim());
+                }
+                break;
+
+            case ProtocolConstants.CMD_CREATE_ROOM:
+                if (parts.length >= 2 && ctx.isAuthenticated()) {
+                    String room = parts[1].trim();
+                    String topic = parts.length >= 3 ? DataPersistenceManager.decodeField(parts[2].trim()) : "";
+                    boolean created = registry.createRoom(room, topic);
+                    broadcastRoomList();
+                    sendDirectMessage(ctx, ProtocolConstants.EVT_SYSTEM + ProtocolConstants.DELIMITER
+                        + (created ? "Created study room " + room : "Room " + room + " already exists - joined instead"));
+                    if (!created) {
+                        sendHistoryBatch(ctx, room);
+                    }
+                }
+                break;
+
+            case ProtocolConstants.CMD_SET_TOPIC:
+                if (parts.length >= 3 && ctx.isAuthenticated()) {
+                    String room = parts[1].trim();
+                    String topic = DataPersistenceManager.decodeField(parts[2].trim());
+                    registry.setRoomTopic(room, topic);
+                    broadcastRoomList();
+                }
+                break;
+
+            case ProtocolConstants.CMD_PIN:
+                if (parts.length >= 2 && ctx.isAuthenticated()) {
+                    String room = parts[1].trim();
+                    String payload = parts.length >= 3 ? parts[2].trim() : "";
+                    String role = ctx.getRole();
+                    boolean moderator = ProtocolConstants.ROLE_MODERATOR.equalsIgnoreCase(role);
+
+                    if (!payload.isEmpty() && !moderator) {
+                        sendDirectMessage(ctx, ProtocolConstants.EVT_SYSTEM + ProtocolConstants.DELIMITER
+                            + "Only moderators can pin messages to a room.");
+                        break;
+                    }
+
+                    registry.setRoomPinned(room, payload);
+                    broadcastToRoom(room, ProtocolConstants.EVT_PINNED + ProtocolConstants.DELIMITER + room
+                        + ProtocolConstants.DELIMITER + payload);
+
+                    telemetrySink.accept(new PacketLogEvent(
+                        PacketLogEvent.Module.NIO_SELECTOR,
+                        PacketLogEvent.Direction.TX,
+                        payload.isEmpty() ? "Pinned Message Cleared" : "Message Pinned To Room",
+                        "Room: " + room + " | By: " + ctx.getUsername() + " (" + role + ")"
+                    ));
                 }
                 break;
 
@@ -254,17 +330,26 @@ public class NioChatServer {
                 if (parts.length >= 4 && ctx.isAuthenticated()) {
                     String room = parts[1].trim();
                     String encFlag = parts[2].trim();
-                    String content = parts[3];
+                    // Trailing field is the optional reply reference ("sender|snippet|time", escaped).
+                    boolean hasReplyRef = parts.length >= 5;
+                    String replyRef = hasReplyRef ? parts[parts.length - 1].trim() : "";
+                    String content = joinRange(parts, 3, hasReplyRef ? parts.length - 1 : parts.length);
                     String time = LocalTime.now().format(TIME_FMT);
+                    String sender = ctx.getUsername();
+                    String role = ctx.getRole();
 
                     String broadcastPayload = ProtocolConstants.EVT_CHAT + ProtocolConstants.DELIMITER +
                         room + ProtocolConstants.DELIMITER +
-                        ctx.getUsername() + ProtocolConstants.DELIMITER +
+                        sender + ProtocolConstants.DELIMITER +
                         encFlag + ProtocolConstants.DELIMITER +
                         content + ProtocolConstants.DELIMITER +
-                        time;
+                        time + ProtocolConstants.DELIMITER +
+                        replyRef;
 
                     broadcastToRoom(room, broadcastPayload);
+
+                    // Append-only transcript on disk (survives restarts)
+                    persistence.appendMessage(room, sender, role, encFlag, content, replyRef, time);
 
                     // If PLAIN text and contains URL, asynchronously trigger LinkPreviewCallable
                     if (ProtocolConstants.ENC_PLAIN.equalsIgnoreCase(encFlag)) {
@@ -281,6 +366,9 @@ public class NioChatServer {
                                         preview.getStatusCode() + ProtocolConstants.DELIMITER +
                                         preview.getTitle();
                                     broadcastToRoom(room, linkPayload);
+                                    persistence.appendHistory(room, new DataPersistenceManager.HistoryEntry(
+                                        ProtocolConstants.HIST_LINK, time, sender, role, encFlag,
+                                        preview.getRawUrl() + "|" + preview.getHostIp() + "|" + preview.getStatusCode() + "|" + preview.getTitle(), ""));
                                 } catch (Exception ignored) {}
                             });
                         }
@@ -292,7 +380,7 @@ public class NioChatServer {
                 if (parts.length >= 4 && ctx.isAuthenticated()) {
                     String targetUser = parts[1].trim();
                     String encFlag = parts[2].trim();
-                    String content = parts[3];
+                    String content = joinRange(parts, 3, parts.length);
                     String time = LocalTime.now().format(TIME_FMT);
 
                     ClientChannelContext targetCtx = contextsByUsername.get(targetUser.toLowerCase());
@@ -302,7 +390,7 @@ public class NioChatServer {
                             ctx.getUsername() + ProtocolConstants.DELIMITER +
                             encFlag + ProtocolConstants.DELIMITER +
                             content + ProtocolConstants.DELIMITER +
-                            time;
+                            time + ProtocolConstants.DELIMITER + "";
                         sendDirectMessage(targetCtx, dmPayload);
                         sendDirectMessage(ctx, dmPayload);
                     } else {
@@ -315,6 +403,97 @@ public class NioChatServer {
                 break;
         }
     }
+
+    // ------------------------------------------------------------------
+    // Workspace snapshot helpers (rooms / pins / history / vault)
+    // ------------------------------------------------------------------
+
+    /** {@code ROOM_LIST|<room>:<topic>|...} - one frame listing every persisted room. */
+    public void sendRoomList(ClientChannelContext ctx) {
+        StringBuilder sb = new StringBuilder(ProtocolConstants.EVT_ROOM_LIST);
+        for (Map.Entry<String, String> entry : registry.getRoomTopics().entrySet()) {
+            sb.append(ProtocolConstants.DELIMITER)
+                .append(DataPersistenceManager.encodeField(entry.getKey()))
+                .append(":")
+                .append(DataPersistenceManager.encodeField(entry.getValue()));
+        }
+        sendDirectMessage(ctx, sb.toString());
+    }
+
+    public void broadcastRoomList() {
+        for (ClientChannelContext ctx : allContexts) {
+            if (ctx.isAuthenticated()) {
+                sendRoomList(ctx);
+            }
+        }
+    }
+
+    /** {@code PINNED|<room>|<payload>} - empty payload clears the banner. */
+    public void sendPinnedMessage(ClientChannelContext ctx, String room) {
+        String payload = registry.getRoomPinned(room);
+        if (payload != null && !payload.isEmpty()) {
+            sendDirectMessage(ctx, ProtocolConstants.EVT_PINNED + ProtocolConstants.DELIMITER + room
+                + ProtocolConstants.DELIMITER + payload);
+        }
+    }
+
+    /**
+     * {@code HISTORY_BATCH|<room>|<count>|<entry>|...} - replays the persisted transcript.
+     * Each entry is an escaped {@code kind|timestamp|sender|role|encFlag|payload|replyRef} line.
+     */
+    public void sendHistoryBatch(ClientChannelContext ctx, String room) {
+        List<DataPersistenceManager.HistoryEntry> entries =
+            persistence.getRecentHistory(room, NetworkConfig.HISTORY_REPLAY_LIMIT);
+
+        StringBuilder sb = new StringBuilder();
+        sb.append(ProtocolConstants.EVT_HISTORY_BATCH)
+            .append(ProtocolConstants.DELIMITER).append(room)
+            .append(ProtocolConstants.DELIMITER).append(entries.size());
+        for (DataPersistenceManager.HistoryEntry entry : entries) {
+            sb.append(ProtocolConstants.DELIMITER).append(entry.toLine());
+        }
+        sendDirectMessage(ctx, sb.toString());
+
+        if (!entries.isEmpty()) {
+            telemetrySink.accept(new PacketLogEvent(
+                PacketLogEvent.Module.NIO_SELECTOR,
+                PacketLogEvent.Direction.TX,
+                "HISTORY_BATCH Replayed",
+                "Room: " + room + " | Replayed " + entries.size() + " persisted messages to "
+                    + (ctx.getUsername() != null ? ctx.getUsername() : "client")
+            ));
+        }
+    }
+
+    /** One {@code VAULT_LIST|<room>|...} frame per file already stored for the room. */
+    public void sendVaultList(ClientChannelContext ctx, String room) {
+        for (SharedFileRecord record : registry.getFilesForRoom(room)) {
+            sendDirectMessage(ctx, ProtocolConstants.EVT_VAULT_LIST + ProtocolConstants.DELIMITER
+                + room + ProtocolConstants.DELIMITER
+                + DataPersistenceManager.encodeField(record.getFileId()) + ProtocolConstants.DELIMITER
+                + DataPersistenceManager.encodeField(record.getFilename()) + ProtocolConstants.DELIMITER
+                + DataPersistenceManager.encodeField(record.getStoredFilename()) + ProtocolConstants.DELIMITER
+                + record.getFileSize() + ProtocolConstants.DELIMITER
+                + DataPersistenceManager.encodeField(record.getSha256()) + ProtocolConstants.DELIMITER
+                + DataPersistenceManager.encodeField(record.getUploader()) + ProtocolConstants.DELIMITER
+                + DataPersistenceManager.encodeField(record.getTimestamp()));
+        }
+    }
+
+    /** Re-joins the fields of a frame that were split by the protocol delimiter. */
+    private static String joinRange(String[] parts, int from, int to) {
+        if (to <= from) return "";
+        StringBuilder sb = new StringBuilder();
+        for (int i = from; i < to && i < parts.length; i++) {
+            if (i > from) sb.append(ProtocolConstants.DELIMITER);
+            sb.append(parts[i]);
+        }
+        return sb.toString();
+    }
+
+    // ------------------------------------------------------------------
+    // Broadcast helpers
+    // ------------------------------------------------------------------
 
     public void broadcastToRoom(String room, String payload) {
         ByteBuffer buffer = framer.frameMessage(payload);
@@ -353,6 +532,16 @@ public class NioChatServer {
             uploader + ProtocolConstants.DELIMITER +
             sha256;
         broadcastToRoom(room, payload);
+
+        // Journal the file card with the room transcript so it replays for late joiners.
+        persistence.appendHistory(room, new DataPersistenceManager.HistoryEntry(
+            ProtocolConstants.HIST_FILE,
+            LocalTime.now().format(TIME_FMT),
+            uploader,
+            registry.getRoleForUser(uploader),
+            ProtocolConstants.ENC_PLAIN,
+            filename + "|" + size + "|" + uploader + "|" + sha256,
+            ""));
     }
 
     public void sendDirectMessage(ClientChannelContext ctx, String payload) {
@@ -417,5 +606,10 @@ public class NioChatServer {
                 selector.close();
             }
         } catch (Exception ignored) {}
+    }
+
+    /** Flushes the shared persistence engine (invoked from the server shutdown hook). */
+    public void flushPersistence() {
+        persistence.flush();
     }
 }

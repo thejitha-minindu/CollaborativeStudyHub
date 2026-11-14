@@ -1,30 +1,23 @@
 package com.studyhub.ui;
 
 import com.studyhub.common.NetworkConfig;
-import com.studyhub.common.PacketLogEvent;
+import com.studyhub.security.CryptoIntegrityService;
 import com.studyhub.security.TlsAuthClient;
 import com.studyhub.udp.LanDiscoveryListener;
-import com.studyhub.ui.theme.AvatarComponent;
 import com.studyhub.ui.theme.ModernScrollBarUI;
 import com.studyhub.ui.theme.PillButton;
 import com.studyhub.ui.theme.RoundedPanel;
 import com.studyhub.ui.theme.ThemeColors;
 import java.awt.BorderLayout;
-import java.awt.Color;
+import java.awt.CardLayout;
 import java.awt.Cursor;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Font;
-import java.awt.Graphics;
-import java.awt.Graphics2D;
-import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
-import java.awt.Insets;
-import java.awt.RenderingHints;
-import java.awt.event.MouseAdapter;
-import java.awt.event.MouseEvent;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.regex.Pattern;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
@@ -37,15 +30,20 @@ import javax.swing.JPanel;
 import javax.swing.JPasswordField;
 import javax.swing.JScrollPane;
 import javax.swing.JTextField;
-import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
 
 /**
  * Modern Discord-styled onboarding and LAN auto-discovery portal.
  * Features live UDP server cards, one-click demo account switcher pills,
- * and secure TLSv1.3 mutual cipher negotiation.
+ * a self-service student registration form, and secure TLSv1.3 mutual cipher negotiation.
  */
 public class LoginDiscoveryDialog extends JDialog {
+
+    private static final long serialVersionUID = 1L;
+
+    private static final Pattern USERNAME_PATTERN = Pattern.compile("^[A-Za-z0-9_.]{3,24}$");
+    private static final String CARD_LOGIN = "LOGIN";
+    private static final String CARD_REGISTER = "REGISTER";
 
     public static class SessionData {
         public String host;
@@ -54,9 +52,12 @@ public class LoginDiscoveryDialog extends JDialog {
         public int filePort;
         public int pulsePort;
         public String username;
+        public String displayName;
         public String sessionToken;
         public String role;
         public String aesKeyBase64;
+        /** SHA-256 of the password, kept in memory so the NIO channel can auto-reconnect. */
+        public String passwordSha256;
         public TlsAuthClient.CertificateDetails certificateDetails;
     }
 
@@ -75,6 +76,14 @@ public class LoginDiscoveryDialog extends JDialog {
     private String currentUsername = "student1";
     private String currentPassword = "pass123";
 
+    // Mode switching (Sign In <-> Create Student Account)
+    private final CardLayout cardLayout = new CardLayout();
+    private final JPanel cardHost = new JPanel(cardLayout);
+    private String activeCard = CARD_LOGIN;
+    private PillButton signInModeBtn;
+    private PillButton registerModeBtn;
+    private PillButton primaryActionBtn;
+
     // Collapsible manual connection panel
     private JPanel manualSection;
     private boolean manualExpanded = false;
@@ -83,8 +92,13 @@ public class LoginDiscoveryDialog extends JDialog {
     private JTextField userField;
     private JPasswordField passField;
 
+    // Registration form
+    private JTextField regUserField;
+    private JTextField regNameField;
+    private JPasswordField regPassField;
+    private JPasswordField regConfirmField;
+
     private JLabel statusLabel;
-    private PillButton connectButton;
     private PillButton[] accountPills;
 
     public LoginDiscoveryDialog(JFrame parent, NetworkInspectorPanel inspectorPanel) {
@@ -96,8 +110,8 @@ public class LoginDiscoveryDialog extends JDialog {
     }
 
     private void buildModernUI() {
-        setSize(820, 640);
-        setMinimumSize(new Dimension(740, 580));
+        setSize(860, 700);
+        setMinimumSize(new Dimension(760, 620));
         setLocationRelativeTo(null);
         setLayout(new BorderLayout());
         getContentPane().setBackground(ThemeColors.BG_RAIL);
@@ -107,9 +121,9 @@ public class LoginDiscoveryDialog extends JDialog {
         centerWrapper.setOpaque(false);
 
         RoundedPanel mainCard = new RoundedPanel(18, ThemeColors.BG_PANEL, ThemeColors.BORDER_SUBTLE, 1);
-        mainCard.setPreferredSize(new Dimension(700, 540));
-        mainCard.setLayout(new BorderLayout(0, 16));
-        mainCard.setBorder(BorderFactory.createEmptyBorder(24, 28, 20, 28));
+        mainCard.setPreferredSize(new Dimension(720, 600));
+        mainCard.setLayout(new BorderLayout(0, 14));
+        mainCard.setBorder(BorderFactory.createEmptyBorder(22, 26, 18, 26));
 
         // 1. Header (App Icon + Title + Subtitle)
         JPanel headerPanel = new JPanel();
@@ -121,7 +135,7 @@ public class LoginDiscoveryDialog extends JDialog {
         logoLabel.setForeground(ThemeColors.TEXT_PRIMARY);
         logoLabel.setAlignmentX(0.0f);
 
-        JLabel subLabel = new JLabel("Zero-Config LAN Discovery & TLSv1.3 Secure Academic Workspace");
+        JLabel subLabel = new JLabel("Zero-Config LAN Discovery • TLSv1.3 Security • Persistent Study Rooms");
         subLabel.setFont(ThemeColors.FONT_MUTED);
         subLabel.setForeground(ThemeColors.TEXT_MUTED);
         subLabel.setAlignmentX(0.0f);
@@ -130,7 +144,7 @@ public class LoginDiscoveryDialog extends JDialog {
         headerPanel.add(Box.createVerticalStrut(4));
         headerPanel.add(subLabel);
 
-        // 2. Middle Content (Servers List + Account Switcher)
+        // 2. Middle Content
         JPanel contentPanel = new JPanel();
         contentPanel.setLayout(new BoxLayout(contentPanel, BoxLayout.Y_AXIS));
         contentPanel.setOpaque(false);
@@ -156,8 +170,8 @@ public class LoginDiscoveryDialog extends JDialog {
         serversListPanel.setBackground(ThemeColors.BG_CARD);
         serversListPanel.setBorder(BorderFactory.createEmptyBorder(6, 6, 6, 6));
 
-        serversScrollPane.setPreferredSize(new Dimension(640, 115));
-        serversScrollPane.setMaximumSize(new Dimension(Integer.MAX_VALUE, 115));
+        serversScrollPane.setPreferredSize(new Dimension(660, 105));
+        serversScrollPane.setMaximumSize(new Dimension(Integer.MAX_VALUE, 105));
         serversScrollPane.setBackground(ThemeColors.BG_CARD);
         serversScrollPane.getViewport().setBackground(ThemeColors.BG_CARD);
         serversScrollPane.setBorder(BorderFactory.createLineBorder(ThemeColors.BORDER_SUBTLE, 1));
@@ -165,7 +179,77 @@ public class LoginDiscoveryDialog extends JDialog {
 
         renderEmptyHubsPlaceholder();
 
-        // Section B: Quick Account Switcher
+        // Section B: Mode toggle (Sign In / Create Student Account)
+        JPanel modeBar = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        modeBar.setOpaque(false);
+        modeBar.setAlignmentX(0.0f);
+        modeBar.setMaximumSize(new Dimension(Integer.MAX_VALUE, 40));
+
+        signInModeBtn = new PillButton("Sign In", ThemeColors.ACCENT_PRIMARY, ThemeColors.ACCENT_HOVER, ThemeColors.TEXT_PRIMARY, 14);
+        signInModeBtn.setFont(ThemeColors.FONT_BOLD);
+        signInModeBtn.addActionListener(e -> switchMode(CARD_LOGIN));
+
+        registerModeBtn = new PillButton("Create Student Account", ThemeColors.BG_INPUT, ThemeColors.ACCENT_HOVER, ThemeColors.TEXT_MUTED, 14);
+        registerModeBtn.setFont(ThemeColors.FONT_BOLD);
+        registerModeBtn.addActionListener(e -> switchMode(CARD_REGISTER));
+
+        modeBar.add(signInModeBtn);
+        modeBar.add(registerModeBtn);
+
+        // Section C: Card host (login form / registration form)
+        cardHost.setOpaque(false);
+        cardHost.setAlignmentX(0.0f);
+        cardHost.setMaximumSize(new Dimension(Integer.MAX_VALUE, 320));
+        cardHost.add(createLoginCard(), CARD_LOGIN);
+        cardHost.add(createRegisterCard(), CARD_REGISTER);
+
+        contentPanel.add(serversHeader);
+        contentPanel.add(Box.createVerticalStrut(6));
+        contentPanel.add(serversScrollPane);
+        contentPanel.add(Box.createVerticalStrut(14));
+        contentPanel.add(modeBar);
+        contentPanel.add(Box.createVerticalStrut(6));
+        contentPanel.add(cardHost);
+
+        // 3. Footer Bar (Status + Primary Action Button)
+        JPanel footerBar = new JPanel(new BorderLayout(12, 0));
+        footerBar.setOpaque(false);
+
+        statusLabel = new JLabel("Ready. Select a server and profile to begin.");
+        statusLabel.setFont(ThemeColors.FONT_MUTED);
+        statusLabel.setForeground(ThemeColors.TEXT_MUTED);
+
+        primaryActionBtn = new PillButton("Enter Study Hub", ThemeColors.ACCENT_PRIMARY, ThemeColors.ACCENT_HOVER, ThemeColors.TEXT_PRIMARY, 20);
+        primaryActionBtn.setPreferredSize(new Dimension(200, 40));
+        primaryActionBtn.addActionListener(e -> {
+            if (CARD_REGISTER.equals(activeCard)) {
+                performRegister();
+            } else {
+                performLogin();
+            }
+        });
+
+        footerBar.add(statusLabel, BorderLayout.CENTER);
+        footerBar.add(primaryActionBtn, BorderLayout.EAST);
+
+        mainCard.add(headerPanel, BorderLayout.NORTH);
+        mainCard.add(contentPanel, BorderLayout.CENTER);
+        mainCard.add(footerBar, BorderLayout.SOUTH);
+
+        centerWrapper.add(mainCard);
+        add(centerWrapper, BorderLayout.CENTER);
+    }
+
+    // =========================================================================
+    // CARDS
+    // =========================================================================
+
+    private JPanel createLoginCard() {
+        JPanel card = new JPanel();
+        card.setLayout(new BoxLayout(card, BoxLayout.Y_AXIS));
+        card.setOpaque(false);
+        card.setAlignmentX(0.0f);
+
         JLabel accTitle = new JLabel("SELECT EVALUATION PROFILE (2-MINUTE DEMO)");
         accTitle.setFont(ThemeColors.FONT_BOLD);
         accTitle.setForeground(ThemeColors.TEXT_MUTED);
@@ -186,7 +270,6 @@ public class LoginDiscoveryDialog extends JDialog {
             accountPillsBar.add(p);
         }
 
-        // Section C: Collapsible Manual Connection Section
         JPanel toggleManualBar = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
         toggleManualBar.setOpaque(false);
         toggleManualBar.setAlignmentX(0.0f);
@@ -206,44 +289,94 @@ public class LoginDiscoveryDialog extends JDialog {
             manualExpanded = !manualExpanded;
             toggleManualBtn.setText((manualExpanded ? "▼ " : "▶ ") + "Manual Connection Settings (Advanced)");
             manualSection.setVisible(manualExpanded);
-            mainCard.revalidate();
-            mainCard.repaint();
+            cardHost.revalidate();
+            cardHost.repaint();
         });
 
         toggleManualBar.add(toggleManualBtn);
 
-        contentPanel.add(serversHeader);
-        contentPanel.add(Box.createVerticalStrut(6));
-        contentPanel.add(serversScrollPane);
-        contentPanel.add(Box.createVerticalStrut(14));
-        contentPanel.add(accTitle);
-        contentPanel.add(Box.createVerticalStrut(8));
-        contentPanel.add(accountPillsBar);
-        contentPanel.add(Box.createVerticalStrut(10));
-        contentPanel.add(toggleManualBar);
-        contentPanel.add(manualSection);
+        card.add(accTitle);
+        card.add(Box.createVerticalStrut(8));
+        card.add(accountPillsBar);
+        card.add(Box.createVerticalStrut(10));
+        card.add(toggleManualBar);
+        card.add(manualSection);
 
-        // 3. Footer Bar (Status + Connect Button)
-        JPanel footerBar = new JPanel(new BorderLayout(12, 0));
-        footerBar.setOpaque(false);
+        return card;
+    }
 
-        statusLabel = new JLabel("Ready. Select a server and profile to begin.");
-        statusLabel.setFont(ThemeColors.FONT_MUTED);
+    private JPanel createRegisterCard() {
+        JPanel card = new JPanel();
+        card.setLayout(new BoxLayout(card, BoxLayout.Y_AXIS));
+        card.setOpaque(false);
+        card.setAlignmentX(0.0f);
+
+        JLabel title = new JLabel("SELF-SERVICE STUDENT REGISTRATION (Port 9443 TLS)");
+        title.setFont(ThemeColors.FONT_BOLD);
+        title.setForeground(ThemeColors.TEXT_MUTED);
+        title.setAlignmentX(0.0f);
+
+        regUserField = new JTextField(14);
+        styleTextField(regUserField);
+        regNameField = new JTextField(14);
+        styleTextField(regNameField);
+        regPassField = new JPasswordField(14);
+        styleTextField(regPassField);
+        regConfirmField = new JPasswordField(14);
+        styleTextField(regConfirmField);
+
+        JPanel row1 = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
+        row1.setOpaque(false);
+        row1.setAlignmentX(0.0f);
+        row1.setMaximumSize(new Dimension(Integer.MAX_VALUE, 40));
+        row1.add(createInputLabel("Username:"));
+        row1.add(regUserField);
+        row1.add(createInputLabel("Display Name:"));
+        row1.add(regNameField);
+
+        JPanel row2 = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
+        row2.setOpaque(false);
+        row2.setAlignmentX(0.0f);
+        row2.setMaximumSize(new Dimension(Integer.MAX_VALUE, 40));
+        row2.add(createInputLabel("Password:"));
+        row2.add(regPassField);
+        row2.add(createInputLabel("Confirm:"));
+        row2.add(regConfirmField);
+
+        JLabel hint = new JLabel("<html><body style='width: 560px; color:#949BA4;'>"
+            + "New accounts are validated by the TLS auth service and written to <b>data/users.db</b> "
+            + "with a per-account salt, so your username survives a server restart. "
+            + "Usernames are 3-24 characters (letters, digits, _ and .) and passwords need 6+ characters."
+            + "</body></html>");
+        hint.setFont(ThemeColors.FONT_MUTED);
+        hint.setForeground(ThemeColors.TEXT_MUTED);
+        hint.setAlignmentX(0.0f);
+
+        card.add(title);
+        card.add(Box.createVerticalStrut(10));
+        card.add(row1);
+        card.add(Box.createVerticalStrut(8));
+        card.add(row2);
+        card.add(Box.createVerticalStrut(8));
+        card.add(hint);
+
+        return card;
+    }
+
+    private void switchMode(String card) {
+        activeCard = card;
+        cardLayout.show(cardHost, card);
+
+        boolean login = CARD_LOGIN.equals(card);
+        signInModeBtn.setColors(login ? ThemeColors.ACCENT_PRIMARY : ThemeColors.BG_INPUT,
+            ThemeColors.ACCENT_HOVER, ThemeColors.TEXT_PRIMARY);
+        registerModeBtn.setColors(login ? ThemeColors.BG_INPUT : ThemeColors.ACCENT_PRIMARY,
+            ThemeColors.ACCENT_HOVER, ThemeColors.TEXT_PRIMARY);
+        primaryActionBtn.setText(login ? "Enter Study Hub" : "Create Account & Enter");
+        statusLabel.setText(login
+            ? "Ready. Select a server and profile to begin."
+            : "Create a brand new student account - it is stored on the server immediately.");
         statusLabel.setForeground(ThemeColors.TEXT_MUTED);
-
-        connectButton = new PillButton("Enter Study Hub", ThemeColors.ACCENT_PRIMARY, ThemeColors.ACCENT_HOVER, ThemeColors.TEXT_PRIMARY, 20);
-        connectButton.setPreferredSize(new Dimension(170, 40));
-        connectButton.addActionListener(e -> performLogin());
-
-        footerBar.add(statusLabel, BorderLayout.CENTER);
-        footerBar.add(connectButton, BorderLayout.EAST);
-
-        mainCard.add(headerPanel, BorderLayout.NORTH);
-        mainCard.add(contentPanel, BorderLayout.CENTER);
-        mainCard.add(footerBar, BorderLayout.SOUTH);
-
-        centerWrapper.add(mainCard);
-        add(centerWrapper, BorderLayout.CENTER);
     }
 
     private PillButton createAccountPill(String label, String user, String pass, boolean initialSelected) {
@@ -405,9 +538,9 @@ public class LoginDiscoveryDialog extends JDialog {
         card.add(left, BorderLayout.WEST);
         card.add(right, BorderLayout.EAST);
 
-        card.addMouseListener(new MouseAdapter() {
+        card.addMouseListener(new java.awt.event.MouseAdapter() {
             @Override
-            public void mouseClicked(MouseEvent e) {
+            public void mouseClicked(java.awt.event.MouseEvent e) {
                 selectedHost = hub.hostAddress;
                 selectedTlsPort = hub.tlsPort;
                 if (hostField != null) hostField.setText(selectedHost);
@@ -419,19 +552,35 @@ public class LoginDiscoveryDialog extends JDialog {
         return card;
     }
 
-    private void performLogin() {
-        if (manualExpanded) {
+    // =========================================================================
+    // ACTIONS
+    // =========================================================================
+
+    private void resolveManualOverrides() {
+        if (manualExpanded && hostField != null) {
             selectedHost = hostField.getText().trim();
             try {
                 selectedTlsPort = Integer.parseInt(tlsPortField.getText().trim());
             } catch (Exception ignored) {}
+        }
+    }
+
+    private void performLogin() {
+        resolveManualOverrides();
+        if (manualExpanded && userField != null) {
             currentUsername = userField.getText().trim();
             currentPassword = new String(passField.getPassword());
         }
 
+        if (currentUsername.isEmpty()) {
+            statusLabel.setText("Enter a username before connecting.");
+            statusLabel.setForeground(ThemeColors.STATUS_DANGER);
+            return;
+        }
+
         statusLabel.setText("Negotiating TLSv1.3 Handshake with " + selectedHost + ":" + selectedTlsPort + "...");
         statusLabel.setForeground(ThemeColors.STATUS_TYPING);
-        connectButton.setEnabled(false);
+        primaryActionBtn.setEnabled(false);
 
         new Thread(() -> {
             TlsAuthClient authClient = new TlsAuthClient(selectedHost, selectedTlsPort,
@@ -439,34 +588,10 @@ public class LoginDiscoveryDialog extends JDialog {
             TlsAuthClient.AuthResult result = authClient.authenticate(currentUsername, currentPassword);
 
             SwingUtilities.invokeLater(() -> {
-                connectButton.setEnabled(true);
+                primaryActionBtn.setEnabled(true);
                 if (result.success) {
-                    if (inspectorPanel != null) {
-                        inspectorPanel.updateTlsDetails(
-                            result.certificateDetails.cipherSuite,
-                            result.certificateDetails.protocol,
-                            result.certificateDetails.subjectDN,
-                            result.certificateDetails.sha256Fingerprint
-                        );
-                    }
-
-                    resultSession = new SessionData();
-                    resultSession.host = selectedHost;
-                    resultSession.tlsPort = selectedTlsPort;
-                    resultSession.nioPort = NetworkConfig.NIO_CHAT_PORT;
-                    resultSession.filePort = NetworkConfig.FILE_TRANSFER_PORT;
-                    resultSession.pulsePort = NetworkConfig.UDP_PULSE_PORT;
-                    resultSession.username = currentUsername;
-                    resultSession.sessionToken = result.sessionToken;
-                    resultSession.role = result.role;
-                    resultSession.aesKeyBase64 = result.aesKeyBase64;
-                    resultSession.certificateDetails = result.certificateDetails;
-
-                    if (discoveryListener != null) {
-                        discoveryListener.stop();
-                    }
-
-                    dispose();
+                    openSession(authClient, result, currentUsername,
+                        CryptoIntegrityService.computeSha256(currentPassword));
                 } else {
                     statusLabel.setText("Authentication failed: " + result.errorMessage);
                     statusLabel.setForeground(ThemeColors.STATUS_DANGER);
@@ -476,6 +601,103 @@ public class LoginDiscoveryDialog extends JDialog {
                 }
             });
         }, "TLS-Auth-Thread").start();
+    }
+
+    private void performRegister() {
+        resolveManualOverrides();
+
+        final String username = regUserField.getText().trim();
+        final String displayName = regNameField.getText().trim().isEmpty() ? username : regNameField.getText().trim();
+        final String password = new String(regPassField.getPassword());
+        final String confirm = new String(regConfirmField.getPassword());
+
+        if (!USERNAME_PATTERN.matcher(username).matches()) {
+            statusLabel.setText("Username must be 3-24 characters (letters, digits, _ and . only).");
+            statusLabel.setForeground(ThemeColors.STATUS_DANGER);
+            return;
+        }
+        if (password.length() < 6) {
+            statusLabel.setText("Password must be at least 6 characters long.");
+            statusLabel.setForeground(ThemeColors.STATUS_DANGER);
+            return;
+        }
+        if (!password.equals(confirm)) {
+            statusLabel.setText("Passwords do not match.");
+            statusLabel.setForeground(ThemeColors.STATUS_DANGER);
+            return;
+        }
+
+        statusLabel.setText("Registering '" + username + "' over TLSv1.3 (" + selectedHost + ":" + selectedTlsPort + ")...");
+        statusLabel.setForeground(ThemeColors.STATUS_TYPING);
+        primaryActionBtn.setEnabled(false);
+
+        new Thread(() -> {
+            TlsAuthClient authClient = new TlsAuthClient(selectedHost, selectedTlsPort,
+                inspectorPanel != null ? inspectorPanel::logEvent : null);
+
+            TlsAuthClient.RegisterResult registration = authClient.register(username, password, displayName);
+            if (!registration.success) {
+                SwingUtilities.invokeLater(() -> {
+                    primaryActionBtn.setEnabled(true);
+                    statusLabel.setText("Registration failed: " + registration.errorMessage);
+                    statusLabel.setForeground(ThemeColors.STATUS_DANGER);
+                    JOptionPane.showMessageDialog(LoginDiscoveryDialog.this,
+                        "Registration rejected by the Study Hub server:\n" + registration.errorMessage,
+                        "Registration Failed", JOptionPane.WARNING_MESSAGE);
+                });
+                return;
+            }
+
+            // Seamless: log straight in with the freshly created account.
+            TlsAuthClient.AuthResult result = authClient.authenticate(username, password);
+            SwingUtilities.invokeLater(() -> {
+                primaryActionBtn.setEnabled(true);
+                if (result.success) {
+                    if (inspectorPanel != null) {
+                        inspectorPanel.logEvent(new com.studyhub.common.PacketLogEvent(
+                            com.studyhub.common.PacketLogEvent.Module.TLS_SECURITY,
+                            com.studyhub.common.PacketLogEvent.Direction.RX,
+                            "Student Account Created",
+                            "'" + username + "' (" + displayName + ") is now persisted on the server vault"));
+                    }
+                    openSession(authClient, result, username, CryptoIntegrityService.computeSha256(password));
+                } else {
+                    statusLabel.setText("Account created, but login failed: " + result.errorMessage);
+                    statusLabel.setForeground(ThemeColors.STATUS_DANGER);
+                }
+            });
+        }, "TLS-Register-Thread").start();
+    }
+
+    private void openSession(TlsAuthClient authClient, TlsAuthClient.AuthResult result, String username, String passwordSha256) {
+        if (inspectorPanel != null) {
+            inspectorPanel.updateTlsDetails(
+                result.certificateDetails.cipherSuite,
+                result.certificateDetails.protocol,
+                result.certificateDetails.subjectDN,
+                result.certificateDetails.sha256Fingerprint
+            );
+        }
+
+        resultSession = new SessionData();
+        resultSession.host = selectedHost;
+        resultSession.tlsPort = selectedTlsPort;
+        resultSession.nioPort = NetworkConfig.NIO_CHAT_PORT;
+        resultSession.filePort = NetworkConfig.FILE_TRANSFER_PORT;
+        resultSession.pulsePort = NetworkConfig.UDP_PULSE_PORT;
+        resultSession.username = username;
+        resultSession.displayName = result.displayName.isEmpty() ? username : result.displayName;
+        resultSession.sessionToken = result.sessionToken;
+        resultSession.role = result.role;
+        resultSession.aesKeyBase64 = result.aesKeyBase64;
+        resultSession.passwordSha256 = passwordSha256;
+        resultSession.certificateDetails = result.certificateDetails;
+
+        if (discoveryListener != null) {
+            discoveryListener.stop();
+        }
+
+        dispose();
     }
 
     public SessionData getSessionData() {

@@ -3,7 +3,6 @@ package com.studyhub.ui.theme;
 import java.awt.Color;
 import java.awt.Cursor;
 import java.awt.Dimension;
-import java.awt.Font;
 import java.awt.FontMetrics;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
@@ -16,6 +15,8 @@ import javax.swing.JButton;
  * Modern pill-shaped button with smooth hover/press animations and antialiased rendering.
  */
 public class PillButton extends JButton {
+
+    private static final long serialVersionUID = 1L;
 
     private Color normalBg;
     private Color hoverBg;

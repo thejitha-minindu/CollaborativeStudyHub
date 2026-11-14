@@ -1,5 +1,6 @@
 package com.studyhub.server;
 
+import com.studyhub.common.DataPersistenceManager;
 import com.studyhub.common.NetworkConfig;
 import com.studyhub.common.PacketLogEvent;
 import com.studyhub.concurrent.ResourceConcurrentEngine;
@@ -24,6 +25,7 @@ public class StudyHubServerMain {
     private final FileTransferServer fileTransferServer;
     private final LanDiscoveryBroadcaster discoveryBroadcaster;
     private final PresencePulseService presencePulseService;
+    private volatile boolean shutdownHookRegistered = false;
 
     public StudyHubServerMain() {
         this.registry = new SafeRoomRegistry();
@@ -42,6 +44,12 @@ public class StudyHubServerMain {
 
     public void start() throws Exception {
         printBanner();
+
+        // 0. Restore durable state from disk (users, rooms + topics + pins, vault index, histories)
+        DataPersistenceManager persistence = DataPersistenceManager.getInstance();
+        System.out.println("[BOOTSTRAP] Disk persistence online at " + persistence.getDataDirectory().toAbsolutePath().normalize());
+        System.out.println("[BOOTSTRAP] Restored " + persistence.getUserCount() + " accounts, "
+            + persistence.getRooms().size() + " rooms, " + persistence.getVaultEntries().size() + " vaulted files.");
 
         // 1. Ensure Keystore exists (Auto-generate via keytool if absent)
         System.out.println("[BOOTSTRAP] Checking TLS Keystore at " + NetworkConfig.KEYSTORE_PATH + "...");
@@ -70,7 +78,10 @@ public class StudyHubServerMain {
 
         System.out.println("\n>>> All 5 Collaborative Study Hub networking services are LIVE. <<<\n");
 
-        Runtime.getRuntime().addShutdownHook(new Thread(this::stop, "StudyHub-ShutdownHook"));
+        if (!shutdownHookRegistered) {
+            shutdownHookRegistered = true;
+            Runtime.getRuntime().addShutdownHook(new Thread(this::stop, "StudyHub-ShutdownHook"));
+        }
     }
 
     public void stop() {
@@ -81,6 +92,18 @@ public class StudyHubServerMain {
         nioChatServer.stop();
         tlsAuthServer.stop();
         concurrentEngine.shutdown();
+
+        // Final clean flush of every durable slice of state (users, rooms, histories, vault index)
+        try {
+            nioChatServer.flushPersistence();
+        } catch (Exception ignored) {}
+        try {
+            DataPersistenceManager.getInstance().flush();
+            System.out.println("[SHUTDOWN] Persistent state flushed to " + NetworkConfig.DATA_DIR + "/");
+        } catch (Exception e) {
+            System.err.println("[SHUTDOWN] Persistence flush warning: " + e.getMessage());
+        }
+
         System.out.println("[SHUTDOWN] All services stopped cleanly.");
     }
 
@@ -93,6 +116,8 @@ public class StudyHubServerMain {
         System.out.println(" * Module 3 (TLS & Keystore):     Port " + NetworkConfig.TLS_AUTH_PORT + " (SSL/TLS v1.3)");
         System.out.println(" * Module 4 (UDP LAN Beacons):    Port " + NetworkConfig.UDP_DISCOVERY_PORT + " & " + NetworkConfig.UDP_PULSE_PORT + " (Datagram)");
         System.out.println(" * Module 5 (Thread Pool & HTTP): 5 Worker Threads active");
+        System.out.println(" * Disk Persistence Engine:       " + NetworkConfig.DATA_DIR
+            + "/ (users.db, rooms.db, vault_index.db, history_<room>.log)");
         System.out.println("======================================================================\n");
     }
 

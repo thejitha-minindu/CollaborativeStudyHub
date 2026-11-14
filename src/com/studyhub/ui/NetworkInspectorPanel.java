@@ -2,13 +2,11 @@ package com.studyhub.ui;
 
 import com.studyhub.common.PacketLogEvent;
 import com.studyhub.ui.theme.ModernScrollBarUI;
-import com.studyhub.ui.theme.RoundedPanel;
 import com.studyhub.ui.theme.ThemeColors;
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
-import java.awt.Font;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
 import java.awt.Insets;
@@ -28,6 +26,8 @@ import javax.swing.plaf.basic.BasicTabbedPaneUI;
  * Designed for 2-minute live university evaluations across all 5 group member domains.
  */
 public class NetworkInspectorPanel extends JPanel {
+
+    private static final long serialVersionUID = 1L;
 
     private final JTextArea nioLogArea = createTerminalLogArea();
     private final JTextArea fileLogArea = createTerminalLogArea();

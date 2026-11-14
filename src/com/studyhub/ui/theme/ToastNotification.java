@@ -8,7 +8,6 @@ import java.awt.Graphics;
 import java.awt.Graphics2D;
 import java.awt.RenderingHints;
 import javax.swing.BorderFactory;
-import javax.swing.JComponent;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JLayeredPane;
@@ -21,6 +20,8 @@ import javax.swing.Timer;
  * integrity verification, and security events.
  */
 public class ToastNotification extends JPanel {
+
+    private static final long serialVersionUID = 1L;
 
     public enum Type {
         SUCCESS(ThemeColors.STATUS_ONLINE, "✓"),

@@ -1,5 +1,6 @@
 package com.studyhub.transfer;
 
+import com.studyhub.common.DataPersistenceManager;
 import com.studyhub.common.NetworkConfig;
 import com.studyhub.common.PacketLogEvent;
 import com.studyhub.common.ProtocolConstants;
@@ -23,9 +24,15 @@ import java.util.function.Consumer;
 /**
  * [MEMBER 2: TCP Sockets & NIO FileChannel]
  * TCP File Transfer client for uploading and downloading study resources.
- * Performs end-to-end SHA-256 cryptographic hashing and FileChannel buffer streaming.
+ * Performs end-to-end SHA-256 cryptographic hashing and FileChannel buffer streaming,
+ * with live byte-progress reporting and duplicate-safe local downloads.
  */
 public class FileTransferClient {
+
+    /** Live transfer progress sink (bytes transferred / total bytes). */
+    public interface ProgressListener {
+        void onProgress(long transferred, long totalBytes);
+    }
 
     public static class TransferResult {
         public final boolean success;
@@ -34,14 +41,24 @@ public class FileTransferClient {
         public final String actualSha;
         public final String message;
         public final File savedFile;
+        public final String storedFilename;
+        public final String timestamp;
 
-        public TransferResult(boolean success, boolean tampered, String expectedSha, String actualSha, String message, File savedFile) {
+        public TransferResult(boolean success, boolean tampered, String expectedSha, String actualSha,
+                              String message, File savedFile) {
+            this(success, tampered, expectedSha, actualSha, message, savedFile, "", "");
+        }
+
+        public TransferResult(boolean success, boolean tampered, String expectedSha, String actualSha,
+                              String message, File savedFile, String storedFilename, String timestamp) {
             this.success = success;
             this.tampered = tampered;
             this.expectedSha = expectedSha != null ? expectedSha : "";
             this.actualSha = actualSha != null ? actualSha : "";
             this.message = message != null ? message : "";
             this.savedFile = savedFile;
+            this.storedFilename = storedFilename != null ? storedFilename : "";
+            this.timestamp = timestamp != null ? timestamp : "";
         }
 
         public static TransferResult fail(String msg) {
@@ -61,10 +78,31 @@ public class FileTransferClient {
         this.telemetrySink = telemetrySink != null ? telemetrySink : e -> {};
     }
 
+    /** Directory that keeps this user's downloads tidy: {@code downloads/<username>/}. */
+    public static File getUserDownloadDir(String username) {
+        String safeUser = (username == null || username.trim().isEmpty()) ? "guest" : username.trim();
+        safeUser = safeUser.replaceAll("[^A-Za-z0-9._\\-]", "_");
+        File dir = new File(NetworkConfig.DOWNLOADS_DIR, safeUser);
+        if (!dir.exists()) {
+            dir.mkdirs();
+        }
+        return dir;
+    }
+
+    // ==================================================================
+    // UPLOAD
+    // ==================================================================
+
+    public TransferResult uploadFile(String room, File file, boolean simulateTamper) {
+        return uploadFile(room, file, simulateTamper, null);
+    }
+
     /**
      * Uploads a file to the server using TCP Socket + NIO FileChannel.
+     *
+     * @param listener optional sink invoked with live byte progress (may be {@code null})
      */
-    public TransferResult uploadFile(String room, File file, boolean simulateTamper) {
+    public TransferResult uploadFile(String room, File file, boolean simulateTamper, ProgressListener listener) {
         if (file == null || !file.exists() || !file.isFile()) {
             return TransferResult.fail("File does not exist: " + file);
         }
@@ -90,7 +128,7 @@ public class FileTransferClient {
                 ProtocolConstants.CMD_UPLOAD,
                 sessionToken,
                 room,
-                file.getName(),
+                FileNameUtils.sanitizeName(file.getName()),
                 fileSize,
                 localSha256,
                 simulateTamper
@@ -105,6 +143,11 @@ public class FileTransferClient {
                 "SHA-256: " + localSha256
             ));
 
+            long sent = 0;
+            if (listener != null) {
+                listener.onProgress(0L, fileSize);
+            }
+
             // Stream file bytes using FileChannel and ByteBuffer
             try (FileChannel fileChannel = FileChannel.open(file.toPath(), StandardOpenOption.READ)) {
                 ByteBuffer buffer = ByteBuffer.allocate(NetworkConfig.FILE_CHUNK_SIZE);
@@ -114,8 +157,17 @@ public class FileTransferClient {
                     buffer.get(chunk);
                     out.write(chunk);
                     buffer.clear();
+
+                    sent += chunk.length;
+                    if (listener != null) {
+                        listener.onProgress(sent, fileSize);
+                    }
                 }
                 out.flush();
+            }
+
+            if (listener != null) {
+                listener.onProgress(fileSize, fileSize);
             }
 
             // Read server verification response
@@ -124,19 +176,22 @@ public class FileTransferClient {
                 return TransferResult.fail("Server closed connection during upload");
             }
 
-            String[] parts = response.split(ProtocolConstants.DELIMITER_REGEX);
+            String[] parts = response.split(ProtocolConstants.DELIMITER_REGEX, -1);
             String status = parts[0];
 
             if (ProtocolConstants.RESP_UPLOAD_OK.equalsIgnoreCase(status)) {
                 String serverSha = parts.length > 1 ? parts[1] : "";
+                String storedName = parts.length > 2 ? DataPersistenceManager.decodeField(parts[2].trim()) : file.getName();
+                String timestamp = parts.length > 3 ? DataPersistenceManager.decodeField(parts[3].trim()) : "";
                 telemetrySink.accept(new PacketLogEvent(
                     PacketLogEvent.Module.TCP_FILECHANNEL,
                     PacketLogEvent.Direction.RX,
                     "UPLOAD_OK Received",
                     "Server verified SHA-256 integrity match!",
-                    "Server SHA: " + serverSha
+                    "Server SHA: " + serverSha + " | Stored as: " + storedName
                 ));
-                return new TransferResult(true, false, localSha256, serverSha, "Upload successful and verified", file);
+                return new TransferResult(true, false, localSha256, serverSha,
+                    "Upload successful and verified", file, storedName, timestamp);
 
             } else if (ProtocolConstants.RESP_UPLOAD_TAMPERED.equalsIgnoreCase(status)) {
                 String expSha = parts.length > 1 ? parts[1] : localSha256;
@@ -165,13 +220,33 @@ public class FileTransferClient {
         }
     }
 
-    /**
-     * Downloads a file from the server using TCP Socket + NIO FileChannel.
-     */
+    // ==================================================================
+    // DOWNLOAD
+    // ==================================================================
+
+    /** Downloads into {@code targetDir}, auto-renaming duplicates ({@code notes (1).pdf}). */
     public TransferResult downloadFile(String room, String filename, File targetDir) {
-        if (!targetDir.exists()) {
-            targetDir.mkdirs();
+        return downloadInto(room, filename, targetDir, null, null);
+    }
+
+    public TransferResult downloadFile(String room, String filename, File targetDir, ProgressListener listener) {
+        return downloadInto(room, filename, targetDir, null, listener);
+    }
+
+    /** Downloads to one exact destination file (overwriting it). */
+    public TransferResult downloadToFile(String room, String filename, File destination, ProgressListener listener) {
+        return downloadInto(room, filename, destination.getParentFile(), destination, listener);
+    }
+
+    private TransferResult downloadInto(String room, String filename, File targetDir, File forcedDestination, ProgressListener listener) {
+        File dir = targetDir != null ? targetDir : new File(NetworkConfig.DOWNLOADS_DIR);
+        if (!dir.exists()) {
+            dir.mkdirs();
         }
+
+        File destFile = forcedDestination != null
+            ? forcedDestination
+            : FileNameUtils.uniqueFile(dir, filename);
 
         try (Socket socket = new Socket(host, port)) {
             socket.setSoTimeout(NetworkConfig.TCP_SOCKET_TIMEOUT_MS);
@@ -183,14 +258,15 @@ public class FileTransferClient {
 
             // Request header
             writer.println(ProtocolConstants.CMD_DOWNLOAD + ProtocolConstants.DELIMITER +
-                sessionToken + ProtocolConstants.DELIMITER + room + ProtocolConstants.DELIMITER + filename);
+                sessionToken + ProtocolConstants.DELIMITER + room + ProtocolConstants.DELIMITER
+                + FileNameUtils.sanitizeName(filename));
 
             String headerLine = reader.readLine();
             if (headerLine == null) {
                 return TransferResult.fail("Empty response from file server");
             }
 
-            String[] parts = headerLine.split(ProtocolConstants.DELIMITER_REGEX);
+            String[] parts = headerLine.split(ProtocolConstants.DELIMITER_REGEX, -1);
             if (!ProtocolConstants.RESP_DOWNLOAD_OK.equalsIgnoreCase(parts[0]) || parts.length < 3) {
                 return TransferResult.fail("Download rejected: " + headerLine);
             }
@@ -203,6 +279,10 @@ public class FileTransferClient {
             ByteBuffer buffer = ByteBuffer.allocate(NetworkConfig.FILE_CHUNK_SIZE);
 
             long totalBytesRead = 0;
+            if (listener != null) {
+                listener.onProgress(0L, fileSize);
+            }
+
             try (FileChannel fileChannel = FileChannel.open(tempFile.toPath(),
                     StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
 
@@ -220,6 +300,9 @@ public class FileTransferClient {
                     fileChannel.write(buffer);
 
                     totalBytesRead += read;
+                    if (listener != null) {
+                        listener.onProgress(totalBytesRead, fileSize);
+                    }
                 }
             }
 
@@ -236,7 +319,6 @@ public class FileTransferClient {
                 return new TransferResult(false, true, expectedSha256, computedSha256, "Tamper detected during download", null);
             }
 
-            File destFile = new File(targetDir, filename);
             Files.move(tempFile.toPath(), destFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
 
             telemetrySink.accept(new PacketLogEvent(
