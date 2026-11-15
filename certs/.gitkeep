@@ -1,0 +1,1 @@
+# Keeps certs directory in git repository while ignoring generated keystores
