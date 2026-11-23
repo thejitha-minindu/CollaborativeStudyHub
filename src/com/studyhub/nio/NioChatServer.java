@@ -465,7 +465,9 @@ public class NioChatServer {
             .append(ProtocolConstants.DELIMITER).append(room)
             .append(ProtocolConstants.DELIMITER).append(entries.size());
         for (DataPersistenceManager.HistoryEntry entry : entries) {
-            sb.append(ProtocolConstants.DELIMITER).append(entry.toLine());
+            // A history line has its own pipe-delimited fields. Escape the whole record
+            // once more so it occupies exactly one field in the outer batch.
+            sb.append(ProtocolConstants.DELIMITER).append(DataPersistenceManager.encodeField(entry.toLine()));
         }
         sendDirectMessage(ctx, sb.toString());
 

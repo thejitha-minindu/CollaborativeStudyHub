@@ -115,9 +115,18 @@ public class VerifyIntegrationTest {
 
             byte[] buf = new byte[1024];
             DatagramPacket packet = new DatagramPacket(buf, buf.length);
-            socket.receive(packet);
-
-            String raw = new String(packet.getData(), packet.getOffset(), packet.getLength(), StandardCharsets.UTF_8);
+            // Other live workspaces may beacon on the same LAN during verification.
+            // Select our test host rather than asserting against the first unrelated packet.
+            String raw;
+            long deadline = System.currentTimeMillis() + 7000;
+            do {
+                packet.setLength(buf.length);
+                socket.receive(packet);
+                raw = new String(packet.getData(), packet.getOffset(), packet.getLength(), StandardCharsets.UTF_8);
+                String[] candidate = raw.split("\\|", -1);
+                if (candidate.length >= 9 && candidate[8].equals(TEST_HOST)) break;
+                if (System.currentTimeMillis() >= deadline) throw new AssertionError("No beacon from test host");
+            } while (true);
             System.out.println("  Received UDP Datagram: " + raw);
 
             assertTrue(raw.startsWith("BEACON"), "Packet starts with BEACON header");
@@ -209,6 +218,28 @@ public class VerifyIntegrationTest {
             PresencePulseService.sendClientPulse(TEST_HOST, NetworkConfig.UDP_PULSE_PORT, 999, "student2", "#general", "ONLINE");
             PresencePulseService.sendClientPulse(TEST_HOST, NetworkConfig.UDP_PULSE_PORT, 1001, "student2", "#general", "FOCUS");
             assertTrue(second.await(f -> f.startsWith("PRESENCE_UPDATE|")).endsWith("|FOCUS"), "Stale pulse is discarded on the live server");
+            // Leave #general, then return: decode records exactly as the Swing client does.
+            String plain = "Room replay | literal \\p and \\n " + System.nanoTime();
+            String reply = DataPersistenceManager.encodeField("student3|quoted | text|12:34:56");
+            first.send("MSG|#general|PLAIN|" + plain + "|" + reply);
+            second.await(f -> f.startsWith("CHAT|#general|student2|PLAIN|") && f.contains(plain));
+            first.send("JOIN|#exam-prep");
+            first.await(f -> f.startsWith("SYSTEM|Joined room #exam-prep"));
+            first.send("JOIN|#general");
+            String replay = first.await(f -> f.startsWith("HISTORY_BATCH|#general|"));
+            String[] replayFields = replay.split("\\|", -1);
+            int historyCount = Integer.parseInt(replayFields[2]);
+            assertTrue(replayFields.length == historyCount + 3, "Each replay record occupies one complete outer protocol field");
+            boolean restoredPlain = false, restoredEncrypted = false;
+            for (int i = 3; i < replayFields.length; i++) {
+                DataPersistenceManager.HistoryEntry entry = DataPersistenceManager.HistoryEntry.fromLine(DataPersistenceManager.decodeField(replayFields[i]));
+                assertTrue(entry != null, "Replayed history record parses into a complete message");
+                if (plain.equals(entry.getPayload())) restoredPlain = reply.equals(entry.getReplyRef());
+                if (encrypted.equals(entry.getPayload())) restoredEncrypted = text.equals(CryptoIntegrityService.decryptAes(entry.getPayload(), two.aesKeyBase64));
+            }
+            assertTrue(restoredPlain, "Room switch preserves plain text, literal escapes, pipes and nested reply data");
+            assertTrue(restoredEncrypted, "Room switch preserves readable encrypted messages");
+
             String original = DataPersistenceManager.getInstance().getDisplayName("student2");
             String updated = "LAN Member " + System.nanoTime();
             first.send("UPDATE_PROFILE|" + DataPersistenceManager.encodeField(updated));
@@ -261,7 +292,7 @@ public class VerifyIntegrationTest {
         try (DatagramSocket sender = new DatagramSocket(new InetSocketAddress(TEST_HOST, 0))) {
             sender.setBroadcast(true);
             for (String name : new String[]{"X", "Discovery regression workspace", "Discovery regression workspace"}) {
-                String beacon = "BEACON|1|" + name + "|9443|9000|9001|9877|2|" + (TEST_HOST.startsWith("127.") ? TEST_HOST : "127.0.0.9");
+                String beacon = "BEACON|1|" + name + "|" + NetworkConfig.TLS_AUTH_PORT + "|" + NetworkConfig.NIO_CHAT_PORT + "|" + NetworkConfig.FILE_TRANSFER_PORT + "|" + NetworkConfig.UDP_PULSE_PORT + "|2|" + (TEST_HOST.startsWith("127.") ? TEST_HOST : "127.0.0.9");
                 byte[] data = beacon.getBytes(StandardCharsets.UTF_8);
                 sender.send(new DatagramPacket(data, data.length, java.net.InetAddress.getByName(TEST_HOST), 9876));
             }

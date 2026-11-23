@@ -1310,7 +1310,7 @@ public class MainHubFrame extends JFrame {
                         if (room.equalsIgnoreCase(currentRoom) && count > 0) {
                             renderSystemNotice("Restored " + count + " previous message(s) from this room");
                             for (int i = 3; i < parts.length; i++) {
-                                renderHistoryEntry(parts[i]);
+                                renderHistoryEntry(DataPersistenceManager.decodeField(parts[i]));
                             }
                         }
                     }

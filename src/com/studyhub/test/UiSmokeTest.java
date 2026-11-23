@@ -59,6 +59,7 @@ public final class UiSmokeTest {
                     workspace.getRootPane().getActionMap().get(action).actionPerformed(new ActionEvent(workspace, 0, "diagnostics"));
                 } catch (Exception e) { throw new RuntimeException(e); }
             });
+            verifyRoomHistoryReplay();
             Thread.sleep(500);
             SwingUtilities.invokeAndWait(() -> {
                 try {
@@ -84,6 +85,46 @@ public final class UiSmokeTest {
             System.exit(0);
         } catch (Throwable failure) { failure.printStackTrace(); System.exit(1); }
     }
+    private static void verifyRoomHistoryReplay() throws Exception {
+        String key = com.studyhub.security.CryptoIntegrityService.generateAesKeyBase64();
+        String plain = "Saved notes | C:\\notes\\week1 and literal \\p";
+        String secret = "Encrypted study notes";
+        String encrypted = com.studyhub.security.CryptoIntegrityService.encryptAes(secret, key);
+        com.studyhub.common.DataPersistenceManager.HistoryEntry first = new com.studyhub.common.DataPersistenceManager.HistoryEntry(
+            "MSG", "12:00", "alex", "STUDENT", "PLAIN", plain, "");
+        com.studyhub.common.DataPersistenceManager.HistoryEntry second = new com.studyhub.common.DataPersistenceManager.HistoryEntry(
+            "MSG", "12:01", "sam", "STUDENT", "AES", encrypted, "alex|quoted note|12:00");
+        String replay = "HISTORY_BATCH|#general|2|" + com.studyhub.common.DataPersistenceManager.encodeField(first.toLine())
+            + "|" + com.studyhub.common.DataPersistenceManager.encodeField(second.toLine());
+        SwingUtilities.invokeAndWait(() -> {
+            try {
+                ((LoginDiscoveryDialog.SessionData)field(workspace, "session")).aesKeyBase64 = key;
+                invokeString(workspace, "handleInboundNioFrame", replay);
+            } catch (Exception e) { throw new RuntimeException(e); }
+        });
+        SwingUtilities.invokeAndWait(() -> {
+            try {
+                verifyRenderedMessages(plain, secret);
+                invokeString(workspace, "switchRoom", "#exam-prep");
+                require(((java.util.List<?>)field(workspace, "messageCards")).isEmpty(), "Switching rooms clears the previous room feed");
+                invokeString(workspace, "switchRoom", "#general");
+                invokeString(workspace, "handleInboundNioFrame", replay);
+            } catch (Exception e) { throw new RuntimeException(e); }
+        });
+        SwingUtilities.invokeAndWait(() -> {
+            try { verifyRenderedMessages(plain, secret); snapshot(workspace, "08-restored-room-history"); }
+            catch (Exception e) { throw new RuntimeException(e); }
+        });
+    }
+    private static void verifyRenderedMessages(String plain, String secret) throws Exception {
+        java.util.List<?> cards = (java.util.List<?>)field(workspace, "messageCards");
+        require(cards.size() == 2 && plain.equals(field(cards.get(0), "text")) && secret.equals(field(cards.get(1), "text")),
+            "Saved plain and encrypted messages render after returning to the room");
+    }
+    private static void invokeString(Object obj, String name, String argument) throws Exception {
+        Method method = obj.getClass().getDeclaredMethod(name, String.class); method.setAccessible(true); method.invoke(obj, argument);
+    }
+
     private static void snapshot(Window window, String name) throws Exception {
         window.validate();
         BufferedImage image = new BufferedImage(window.getWidth(), window.getHeight(), BufferedImage.TYPE_INT_RGB);
