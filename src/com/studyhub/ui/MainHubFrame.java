@@ -17,6 +17,7 @@ import com.studyhub.ui.theme.ModernScrollBarUI;
 import com.studyhub.ui.theme.PillButton;
 import com.studyhub.ui.theme.RoundedPanel;
 import com.studyhub.ui.theme.ThemeColors;
+import com.studyhub.ui.theme.VectorIcon;
 import com.studyhub.ui.theme.ToastNotification;
 import java.awt.BorderLayout;
 import java.awt.Color;
@@ -99,7 +100,7 @@ public class MainHubFrame extends JFrame {
     private final LoginDiscoveryDialog.SessionData session;
     private final NetworkInspectorPanel inspectorPanel;
     private final MessageFramer framer = new MessageFramer();
-    private final AtomicLong pulseSeq = new AtomicLong(1);
+    private final AtomicLong pulseSeq = new AtomicLong(System.currentTimeMillis());
 
     /** Dedicated pool for the asynchronous {@code FileSearchCallable} vault filter. */
     private final ResourceConcurrentEngine searchEngine = new ResourceConcurrentEngine(2);
@@ -135,8 +136,7 @@ public class MainHubFrame extends JFrame {
     private final Component chatFiller = Box.createVerticalGlue();
     private final JTextField messageInput = new JTextField();
     private final PillButton sendBtn = new PillButton("Send");
-    private final PillButton aesToggleBtn = new PillButton("🔒 AES-128: ON", ThemeColors.STATUS_ONLINE, ThemeColors.STATUS_ONLINE.darker(), ThemeColors.TEXT_PRIMARY, 14);
-    private final PillButton tamperToggleBtn = new PillButton("⚠ Tamper Test: OFF", ThemeColors.BG_INPUT, ThemeColors.BG_HOVER, ThemeColors.TEXT_MUTED, 14);
+    private final PillButton aesToggleBtn = new PillButton("", ThemeColors.BG_INPUT, ThemeColors.BG_HOVER, ThemeColors.STATUS_ONLINE, 12);
     private final JLabel typingIndicatorLabel = new JLabel(" ");
     private final JLabel currentRoomHeaderLabel = new JLabel("#general");
     private final JLabel currentRoomTopicLabel = new JLabel("General study discussion and resource sharing");
@@ -145,10 +145,10 @@ public class MainHubFrame extends JFrame {
     // Banners
     private final JPanel topBannerHost = new JPanel();
     private final JPanel reconnectBanner = new JPanel(new BorderLayout(10, 0));
-    private final JLabel reconnectLabel = new JLabel("⟳ Reconnecting to Study Hub...");
+    private final JLabel reconnectLabel = new JLabel("Reconnecting to Study Hub...");
     private final RoundedPanel pinnedBanner = new RoundedPanel(10, ThemeColors.BG_CARD, ThemeColors.ACCENT_PRIMARY, 1);
     private final JLabel pinnedLabel = new JLabel(" ");
-    private final JButton unpinBtn = new JButton("✕");
+    private final JButton unpinBtn = new JButton(new VectorIcon(VectorIcon.Kind.CLOSE, 14, ThemeColors.TEXT_MUTED));
     private String pinnedPayload = "";
 
     // Reply / quote state
@@ -165,11 +165,21 @@ public class MainHubFrame extends JFrame {
     // Vault search (FileSearchCallable)
     private String pendingVaultQuery = "";
     private Timer vaultSearchTimer;
+    private long vaultSearchGeneration;
 
     // Collapsible Inspector Drawer
     private JSplitPane verticalDrawerSplit;
     private boolean inspectorExpanded = false;
-    private PillButton inspectorToggleBtn;
+    private Timer drawerAnimation;
+    private JLabel profileNameLabel;
+    private final JLabel emptyRoom = new JLabel("<html><h2>Welcome to the conversation</h2>Drop files here or start the conversation</html>");
+    private final Map<String, String> memberNames = new LinkedHashMap<>();
+    private final java.util.concurrent.ExecutorService writes = java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "Workspace-Writer"); t.setDaemon(true); return t;
+    });
+    private final java.util.concurrent.ExecutorService pulses = java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "Workspace-Presence"); t.setDaemon(true); return t;
+    });
 
     // Encryption & Tamper States
     private boolean aesEncryptionEnabled = true;
@@ -183,8 +193,11 @@ public class MainHubFrame extends JFrame {
         public final String username;
         public final String status;
         public final String role;
+        public final String displayName;
 
-        public MemberItem(String username, String status, String role) {
+        public MemberItem(String username, String status, String role) { this(username, status, role, username); }
+        public MemberItem(String username, String status, String role, String displayName) {
+            this.displayName = displayName;
             this.username = username;
             this.status = status != null ? status : ProtocolConstants.STATUS_ONLINE;
             this.role = role != null ? role : ProtocolConstants.ROLE_STUDENT;
@@ -221,7 +234,7 @@ public class MainHubFrame extends JFrame {
     }
 
     public MainHubFrame(LoginDiscoveryDialog.SessionData session, NetworkInspectorPanel inspectorPanel) {
-        super("Collaborative Study Hub — " + session.username + " (" + session.role + ")");
+        super(session.workspaceName + " · StudyHub");
         this.session = session;
         this.inspectorPanel = inspectorPanel;
 
@@ -230,6 +243,10 @@ public class MainHubFrame extends JFrame {
             roomTopics.put(r, DataPersistenceManager.defaultRoomTopic(r));
         }
 
+        inspectorPanel.onTamperChanged(enabled -> {
+            simulateTamperEnabled = enabled;
+            if (enabled) ToastNotification.show(this, "Tamper simulation enabled", "Uploads will be rejected after a byte is changed. Disable in TLS & Crypto to resume.", ToastNotification.Type.WARNING);
+        });
         buildDiscordLikeUI();
         connectToNioServer();
         startPresenceHeartbeat();
@@ -239,8 +256,9 @@ public class MainHubFrame extends JFrame {
     // ROOT LAYOUT
     // =========================================================================
     private void buildDiscordLikeUI() {
-        setSize(1280, 860);
-        setMinimumSize(new Dimension(1040, 700));
+        java.awt.Rectangle usable = java.awt.GraphicsEnvironment.getLocalGraphicsEnvironment().getMaximumWindowBounds();
+        setSize(Math.min(1280, usable.width - 24), Math.min(860, usable.height - 24));
+        setMinimumSize(new Dimension(Math.min(1040, usable.width - 24), Math.min(620, usable.height - 24)));
         setLocationRelativeTo(null);
         setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
         getContentPane().setBackground(ThemeColors.BG_CHAT);
@@ -288,8 +306,8 @@ public class MainHubFrame extends JFrame {
         reconnectLabel.setFont(ThemeColors.FONT_BOLD);
         reconnectLabel.setForeground(ThemeColors.STATUS_TYPING);
 
-        JLabel spinner = new JLabel("⟳");
-        spinner.setFont(new Font("Segoe UI", Font.BOLD, 15));
+        JLabel spinner = new JLabel(new VectorIcon(VectorIcon.Kind.ACTIVITY, 18, ThemeColors.STATUS_TYPING));
+        spinner.setFont(new Font("Dialog", Font.BOLD, 15));
         spinner.setForeground(ThemeColors.STATUS_TYPING);
 
         reconnectBanner.add(spinner, BorderLayout.WEST);
@@ -304,7 +322,7 @@ public class MainHubFrame extends JFrame {
             BorderFactory.createEmptyBorder(6, 12, 6, 12)
         ));
 
-        JLabel pinIcon = new JLabel("📌 PINNED");
+        JLabel pinIcon = new JLabel("Pinned message", new VectorIcon(VectorIcon.Kind.PIN, 16, ThemeColors.ACCENT_PRIMARY), JLabel.LEFT);
         pinIcon.setFont(ThemeColors.FONT_BOLD);
         pinIcon.setForeground(ThemeColors.ACCENT_PRIMARY);
 
@@ -354,6 +372,11 @@ public class MainHubFrame extends JFrame {
 
     private void installGlobalShortcuts() {
         getRootPane().getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW)
+            .put(KeyStroke.getKeyStroke(KeyEvent.VK_I, KeyEvent.CTRL_DOWN_MASK | KeyEvent.SHIFT_DOWN_MASK), "diagnostics");
+        getRootPane().getActionMap().put("diagnostics", new AbstractAction() {
+            public void actionPerformed(ActionEvent e) { toggleInspectorDrawer(); }
+        });
+        getRootPane().getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW)
             .put(KeyStroke.getKeyStroke(KeyEvent.VK_F, Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx()), "focusMessageSearch");
         getRootPane().getActionMap().put("focusMessageSearch", new AbstractAction() {
             private static final long serialVersionUID = 1L;
@@ -385,6 +408,10 @@ public class MainHubFrame extends JFrame {
         if (reconnectTimer != null) reconnectTimer.stop();
         if (vaultSearchTimer != null) vaultSearchTimer.stop();
         closeChannel();
+        if (drawerAnimation != null) drawerAnimation.stop();
+        simulateTamperEnabled = false;
+        inspectorPanel.resetTamper();
+        writes.shutdownNow(); pulses.shutdownNow();
         searchEngine.shutdown();
     }
 
@@ -414,24 +441,24 @@ public class MainHubFrame extends JFrame {
             BorderFactory.createEmptyBorder(12, 16, 12, 16)
         ));
 
-        JLabel hubTitle = new JLabel("Study Hub Platform");
-        hubTitle.setFont(ThemeColors.FONT_TITLE);
-        hubTitle.setForeground(ThemeColors.TEXT_PRIMARY);
-
-        PillButton tlsVerifiedPill = new PillButton("🔒 TLSv1.3 • X.509 Verified", ThemeColors.BG_CARD, ThemeColors.BG_HOVER, ThemeColors.STATUS_ONLINE, 12);
-        tlsVerifiedPill.setFont(ThemeColors.FONT_MUTED);
-        tlsVerifiedPill.setBorderColor(ThemeColors.STATUS_ONLINE);
-        tlsVerifiedPill.addActionListener(e -> showTlsCertDialog());
-
-        PillButton vaultPill = new PillButton("📂 Open Downloads Folder", ThemeColors.BG_CARD, ThemeColors.BG_HOVER, ThemeColors.TEXT_MUTED, 12);
-        vaultPill.setFont(ThemeColors.FONT_MUTED);
-        vaultPill.addActionListener(e -> openDownloadsFolder());
-
-        topHubHeader.add(hubTitle);
-        topHubHeader.add(Box.createVerticalStrut(6));
-        topHubHeader.add(tlsVerifiedPill);
-        topHubHeader.add(Box.createVerticalStrut(4));
-        topHubHeader.add(vaultPill);
+        JPanel titleRow = new JPanel(new BorderLayout(8, 0)); titleRow.setOpaque(false);
+        JLabel hubTitle = new JLabel(session.workspaceName);
+        hubTitle.setToolTipText(session.workspaceName);
+        hubTitle.setFont(ThemeColors.FONT_TITLE); hubTitle.setForeground(ThemeColors.TEXT_PRIMARY);
+        PillButton connection = new PillButton("", ThemeColors.BG_RAIL, ThemeColors.BG_HOVER, ThemeColors.STATUS_ONLINE, 10);
+        connection.setIcon(new VectorIcon(VectorIcon.Kind.LOCK, 17, ThemeColors.STATUS_ONLINE));
+        connection.setToolTipText("Encrypted connection • Click for details");
+        connection.getAccessibleContext().setAccessibleName("Connection security");
+        connection.setPreferredSize(new Dimension(32, 32));
+        connection.addActionListener(e -> showTlsCertDialog());
+        titleRow.add(hubTitle, BorderLayout.CENTER); titleRow.add(connection, BorderLayout.EAST);
+        topHubHeader.add(titleRow);
+        if (session.hosting) {
+            PillButton invite = new PillButton("Invite to workspace", ThemeColors.BG_RAIL, ThemeColors.BG_HOVER, ThemeColors.TEXT_MUTED, 10);
+            invite.setIcon(new VectorIcon(VectorIcon.Kind.WIFI, 16, ThemeColors.TEXT_MUTED));
+            invite.addActionListener(e -> showInviteDialog());
+            topHubHeader.add(Box.createVerticalStrut(8)); topHubHeader.add(invite);
+        }
 
         // Rooms Navigation Section
         JPanel roomsSection = new JPanel(new BorderLayout());
@@ -447,7 +474,7 @@ public class MainHubFrame extends JFrame {
         roomsCategory.setForeground(ThemeColors.TEXT_MUTED);
 
         JButton addRoomBtn = new JButton("+");
-        addRoomBtn.setFont(new Font("Segoe UI", Font.BOLD, 14));
+        addRoomBtn.setFont(new Font("Dialog", Font.BOLD, 14));
         addRoomBtn.setForeground(ThemeColors.TEXT_MUTED);
         addRoomBtn.setContentAreaFilled(false);
         addRoomBtn.setBorderPainted(false);
@@ -502,11 +529,13 @@ public class MainHubFrame extends JFrame {
 
         String display = (session.displayName != null && !session.displayName.isEmpty()) ? session.displayName : session.username;
         JLabel usernameLabel = new JLabel(display);
+        profileNameLabel = usernameLabel;
         usernameLabel.setFont(ThemeColors.FONT_HEADER);
         usernameLabel.setForeground(ThemeColors.TEXT_PRIMARY);
 
-        JLabel roleBadge = new JLabel(session.role.toUpperCase());
-        roleBadge.setFont(new Font("Segoe UI", Font.BOLD, 9));
+        JLabel roleBadge = new JLabel(ProtocolConstants.ROLE_MODERATOR.equalsIgnoreCase(session.role) ? "Moderator" : "Member");
+        roleBadge.setBorder(BorderFactory.createEmptyBorder(0, 0, 0, 6));
+        roleBadge.setFont(new Font("Dialog", Font.BOLD, 9));
         roleBadge.setForeground(ProtocolConstants.ROLE_MODERATOR.equalsIgnoreCase(session.role) ? ThemeColors.BADGE_MOD : ThemeColors.BADGE_STUDENT);
 
         namePanel.add(usernameLabel);
@@ -515,40 +544,10 @@ public class MainHubFrame extends JFrame {
         userPanel.add(avatar);
         userPanel.add(namePanel);
 
-        // Live study status (broadcast over the existing UDP PULSE protocol, port 9877)
-        final JComboBox<String> statusCombo = new JComboBox<>(new String[]{"Available", "Focusing / Do Not Disturb", "In Lab"});
-        statusCombo.setFont(ThemeColors.FONT_MUTED);
-        statusCombo.setBackground(ThemeColors.BG_INPUT);
-        statusCombo.setForeground(ThemeColors.TEXT_PRIMARY);
-        statusCombo.setToolTipText("Live study status broadcast via UDP PULSE (Port 9877)");
-        statusCombo.addActionListener(e -> {
-            int idx = statusCombo.getSelectedIndex();
-            currentStatus = ProtocolConstants.SELECTABLE_STATUSES[Math.max(0, Math.min(idx, ProtocolConstants.SELECTABLE_STATUSES.length - 1))];
-            emitPresencePulse(currentStatus);
-        });
-
-        // Bottom row: Inspector drawer + Switch user
-        JPanel buttonRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
-        buttonRow.setOpaque(false);
-
-        inspectorToggleBtn = new PillButton("⚡ Inspector", ThemeColors.BG_INPUT, ThemeColors.BG_HOVER, ThemeColors.TEXT_MUTED, 12);
-        inspectorToggleBtn.setFont(ThemeColors.FONT_MUTED);
-        inspectorToggleBtn.addActionListener(e -> toggleInspectorDrawer());
-
-        PillButton logoutBtn = new PillButton("⇄ Switch User", ThemeColors.BG_INPUT, ThemeColors.STATUS_DANGER, ThemeColors.TEXT_MUTED, 12);
-        logoutBtn.setFont(ThemeColors.FONT_MUTED);
-        logoutBtn.setToolTipText("Log out and sign in as another group member");
-        logoutBtn.addActionListener(e -> switchUser());
-
-        buttonRow.add(inspectorToggleBtn);
-        buttonRow.add(logoutBtn);
-
-        JPanel southPanel = new JPanel();
-        southPanel.setLayout(new BoxLayout(southPanel, BoxLayout.Y_AXIS));
-        southPanel.setOpaque(false);
-        southPanel.add(statusCombo);
-        southPanel.add(Box.createVerticalStrut(6));
-        southPanel.add(buttonRow);
+        PillButton settings = new PillButton("Settings", ThemeColors.BG_CARD, ThemeColors.BG_HOVER, ThemeColors.TEXT_MUTED, 10);
+        settings.setIcon(new VectorIcon(VectorIcon.Kind.SETTINGS, 18, ThemeColors.TEXT_MUTED));
+        settings.addActionListener(e -> showSettingsDialog());
+        JPanel southPanel = new JPanel(new BorderLayout()); southPanel.setOpaque(false); southPanel.add(settings);
 
         bar.add(userPanel, BorderLayout.NORTH);
         bar.add(southPanel, BorderLayout.SOUTH);
@@ -569,7 +568,7 @@ public class MainHubFrame extends JFrame {
             roomCard.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
 
             JLabel hash = new JLabel("#");
-            hash.setFont(new Font("Segoe UI", Font.BOLD, 14));
+            hash.setFont(new Font("Dialog", Font.BOLD, 14));
             hash.setForeground(isActive ? ThemeColors.ACCENT_PRIMARY : ThemeColors.TEXT_MUTED);
 
             JLabel name = new JLabel(room.replace("#", ""));
@@ -581,7 +580,7 @@ public class MainHubFrame extends JFrame {
 
             if (unread != null && unread > 0 && !isActive) {
                 JLabel badge = new JLabel(" " + unread + " ");
-                badge.setFont(new Font("Segoe UI", Font.BOLD, 10));
+                badge.setFont(new Font("Dialog", Font.BOLD, 10));
                 badge.setForeground(ThemeColors.TEXT_PRIMARY);
                 badge.setOpaque(true);
                 badge.setBackground(ThemeColors.STATUS_DANGER);
@@ -646,16 +645,24 @@ public class MainHubFrame extends JFrame {
         return false;
     }
 
-    private void toggleInspectorDrawer() {
-        inspectorExpanded = !inspectorExpanded;
-        inspectorPanel.setVisible(inspectorExpanded);
-        if (inspectorExpanded) {
-            verticalDrawerSplit.setDividerLocation(getHeight() - 250);
-            inspectorToggleBtn.setColors(ThemeColors.ACCENT_PRIMARY, ThemeColors.ACCENT_HOVER, ThemeColors.TEXT_PRIMARY);
-        } else {
-            verticalDrawerSplit.setDividerLocation(getHeight());
-            inspectorToggleBtn.setColors(ThemeColors.BG_INPUT, ThemeColors.BG_HOVER, ThemeColors.TEXT_MUTED);
-        }
+    private void toggleInspectorDrawer() { setDiagnostics(!inspectorExpanded); }
+
+    private void setDiagnostics(boolean expanded) {
+        inspectorExpanded = expanded;
+        if (drawerAnimation != null) drawerAnimation.stop();
+        if (expanded) inspectorPanel.setVisible(true);
+        if (!expanded) { simulateTamperEnabled = false; inspectorPanel.resetTamper(); }
+        int target = Math.max(200, verticalDrawerSplit.getHeight() - (expanded ? 275 : 0));
+        drawerAnimation = new Timer(15, e -> {
+            int current = verticalDrawerSplit.getDividerLocation();
+            int distance = target - current;
+            if (Math.abs(distance) < 4) {
+                verticalDrawerSplit.setDividerLocation(target);
+                if (!expanded) inspectorPanel.setVisible(false);
+                ((Timer)e.getSource()).stop();
+            } else verticalDrawerSplit.setDividerLocation(current + distance / 3 + Integer.signum(distance));
+        });
+        drawerAnimation.start();
     }
 
     // =========================================================================
@@ -676,7 +683,7 @@ public class MainHubFrame extends JFrame {
         JPanel titlePanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
         titlePanel.setOpaque(false);
 
-        currentRoomHeaderLabel.setFont(new Font("Segoe UI", Font.BOLD, 15));
+        currentRoomHeaderLabel.setFont(new Font("Dialog", Font.BOLD, 15));
         currentRoomHeaderLabel.setForeground(ThemeColors.TEXT_PRIMARY);
 
         JLabel divider = new JLabel("|");
@@ -693,30 +700,22 @@ public class MainHubFrame extends JFrame {
         JPanel actionPills = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
         actionPills.setOpaque(false);
 
-        PillButton searchBtn = new PillButton("🔍 Search (Ctrl+F)", ThemeColors.BG_INPUT, ThemeColors.BG_HOVER, ThemeColors.TEXT_MUTED, 14);
+        PillButton searchBtn = new PillButton("Search", ThemeColors.BG_INPUT, ThemeColors.BG_HOVER, ThemeColors.TEXT_MUTED, 14);
         searchBtn.setFont(ThemeColors.FONT_MUTED);
+        searchBtn.setIcon(new VectorIcon(VectorIcon.Kind.SEARCH, 16, ThemeColors.TEXT_MUTED));
+        searchBtn.setToolTipText("Search messages (Ctrl+F)");
         searchBtn.addActionListener(e -> toggleMessageSearch(!searchPanel.isVisible()));
 
-        PillButton shareFileTopBtn = new PillButton("📁 Share File", ThemeColors.ACCENT_PRIMARY, ThemeColors.ACCENT_HOVER, ThemeColors.TEXT_PRIMARY, 14);
+        PillButton shareFileTopBtn = new PillButton("Share File", ThemeColors.ACCENT_PRIMARY, ThemeColors.ACCENT_HOVER, ThemeColors.TEXT_PRIMARY, 14);
+        shareFileTopBtn.setIcon(new VectorIcon(VectorIcon.Kind.FOLDER, 16, ThemeColors.TEXT_PRIMARY));
         shareFileTopBtn.addActionListener(e -> chooseAndUploadFile());
 
-        tamperToggleBtn.addActionListener(e -> {
-            simulateTamperEnabled = !simulateTamperEnabled;
-            if (simulateTamperEnabled) {
-                tamperToggleBtn.setColors(ThemeColors.STATUS_DANGER, ThemeColors.STATUS_DANGER.darker(), ThemeColors.TEXT_PRIMARY);
-                tamperToggleBtn.setText("⚠ Tamper Test: ON");
-                ToastNotification.show(this, "Tamper Simulation Active", "Next file upload will invert byte 0 to test SHA-256 detection!", ToastNotification.Type.WARNING);
-            } else {
-                tamperToggleBtn.setColors(ThemeColors.BG_INPUT, ThemeColors.BG_HOVER, ThemeColors.TEXT_MUTED);
-                tamperToggleBtn.setText("⚠ Tamper Test: OFF");
-            }
-        });
-
         actionPills.add(searchBtn);
-        actionPills.add(tamperToggleBtn);
         actionPills.add(shareFileTopBtn);
 
-        topHeader.add(titlePanel, BorderLayout.WEST);
+        JPanel titles = new JPanel(new BorderLayout(0, 4)); titles.setOpaque(false);
+        titles.add(currentRoomHeaderLabel, BorderLayout.NORTH); titles.add(currentRoomTopicLabel, BorderLayout.CENTER);
+        topHeader.add(titles, BorderLayout.CENTER);
         topHeader.add(actionPills, BorderLayout.EAST);
 
         // Message search bar (Ctrl+F)
@@ -742,7 +741,7 @@ public class MainHubFrame extends JFrame {
             }
         });
 
-        JButton closeSearchBtn = new JButton("✕");
+        JButton closeSearchBtn = new JButton(new VectorIcon(VectorIcon.Kind.CLOSE, 14, ThemeColors.TEXT_MUTED));
         closeSearchBtn.setFont(ThemeColors.FONT_BOLD);
         closeSearchBtn.setForeground(ThemeColors.TEXT_MUTED);
         closeSearchBtn.setContentAreaFilled(false);
@@ -773,6 +772,11 @@ public class MainHubFrame extends JFrame {
         chatFeedPanel.setLayout(new BoxLayout(chatFeedPanel, BoxLayout.Y_AXIS));
         chatFeedPanel.setBackground(ThemeColors.BG_CHAT);
         chatFeedPanel.setBorder(BorderFactory.createEmptyBorder(12, 16, 12, 16));
+        if (chatFeedPanel.getComponentCount() == 0) {
+            emptyRoom.setForeground(ThemeColors.TEXT_MUTED);
+            emptyRoom.setBorder(BorderFactory.createEmptyBorder(28, 20, 28, 20));
+            chatFeedPanel.add(emptyRoom);
+        }
         chatFeedPanel.add(chatFiller);
 
         chatScrollPane.setBackground(ThemeColors.BG_CHAT);
@@ -837,7 +841,7 @@ public class MainHubFrame extends JFrame {
         replyLabel.setFont(ThemeColors.FONT_MUTED);
         replyLabel.setForeground(ThemeColors.TEXT_MUTED);
 
-        JButton cancelReplyBtn = new JButton("✕");
+        JButton cancelReplyBtn = new JButton(new VectorIcon(VectorIcon.Kind.CLOSE, 14, ThemeColors.TEXT_MUTED));
         cancelReplyBtn.setFont(ThemeColors.FONT_BOLD);
         cancelReplyBtn.setForeground(ThemeColors.TEXT_MUTED);
         cancelReplyBtn.setContentAreaFilled(false);
@@ -857,7 +861,7 @@ public class MainHubFrame extends JFrame {
 
         // + Attach File Button
         JButton attachBtn = new JButton("+");
-        attachBtn.setFont(new Font("Segoe UI", Font.BOLD, 18));
+        attachBtn.setFont(new Font("Dialog", Font.BOLD, 18));
         attachBtn.setForeground(ThemeColors.TEXT_MUTED);
         attachBtn.setContentAreaFilled(false);
         attachBtn.setBorderPainted(false);
@@ -884,15 +888,15 @@ public class MainHubFrame extends JFrame {
         JPanel rightTools = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
         rightTools.setOpaque(false);
 
+        aesToggleBtn.setIcon(new VectorIcon(VectorIcon.Kind.LOCK, 17, ThemeColors.STATUS_ONLINE));
+        aesToggleBtn.setPreferredSize(new Dimension(34, 32));
+        aesToggleBtn.setToolTipText("Message encryption enabled (workspace key)");
+        aesToggleBtn.getAccessibleContext().setAccessibleName("Toggle message encryption");
         aesToggleBtn.addActionListener(e -> {
             aesEncryptionEnabled = !aesEncryptionEnabled;
-            if (aesEncryptionEnabled) {
-                aesToggleBtn.setColors(ThemeColors.STATUS_ONLINE, ThemeColors.STATUS_ONLINE.darker(), ThemeColors.TEXT_PRIMARY);
-                aesToggleBtn.setText("🔒 AES-128: ON");
-            } else {
-                aesToggleBtn.setColors(ThemeColors.BG_HOVER, ThemeColors.BG_HOVER.darker(), ThemeColors.TEXT_MUTED);
-                aesToggleBtn.setText("🔓 Plaintext: ON");
-            }
+            aesToggleBtn.setIcon(new VectorIcon(aesEncryptionEnabled ? VectorIcon.Kind.LOCK : VectorIcon.Kind.UNLOCK,
+                17, aesEncryptionEnabled ? ThemeColors.STATUS_ONLINE : ThemeColors.STATUS_TYPING));
+            aesToggleBtn.setToolTipText(aesEncryptionEnabled ? "Message encryption enabled (workspace key)" : "Message encryption disabled");
         });
 
         sendBtn.addActionListener(e -> sendMessage());
@@ -1033,7 +1037,7 @@ public class MainHubFrame extends JFrame {
         new Thread(() -> {
             try {
                 nioChannel = SocketChannel.open();
-                nioChannel.connect(new InetSocketAddress(session.host, session.nioPort));
+                nioChannel.socket().connect(new InetSocketAddress(session.host, session.nioPort), NetworkConfig.TCP_SOCKET_TIMEOUT_MS);
                 connected = true;
 
                 inspectorPanel.logEvent(new PacketLogEvent(
@@ -1066,7 +1070,7 @@ public class MainHubFrame extends JFrame {
 
         // Re-enter the room we were in (critical after an auto-reconnect)
         String join = ProtocolConstants.CMD_JOIN + ProtocolConstants.DELIMITER + currentRoom;
-        sendNioFrame(join);
+        if (!currentRoom.equalsIgnoreCase(ProtocolConstants.DEFAULT_ROOMS[0])) sendNioFrame(join);
     }
 
     private void startNioReader() {
@@ -1077,6 +1081,7 @@ public class MainHubFrame extends JFrame {
             ByteBuffer readBuf = ByteBuffer.allocate(NetworkConfig.NIO_BUFFER_CAPACITY);
             while (connected && nioChannel != null && nioChannel.isOpen()) {
                 try {
+                    readBuf = MessageFramer.ensureWritable(readBuf);
                     int read = nioChannel.read(readBuf);
                     if (read == -1) break;
                     if (read > 0) {
@@ -1127,7 +1132,7 @@ public class MainHubFrame extends JFrame {
         }
         reconnectInProgress = true;
         reconnectAttempt++;
-        reconnectLabel.setText("⟳ Reconnecting to Study Hub... (attempt " + reconnectAttempt + ")");
+        reconnectLabel.setText("Reconnecting to Study Hub... (attempt " + reconnectAttempt + ")");
 
         new Thread(() -> {
             boolean restored = false;
@@ -1137,13 +1142,16 @@ public class MainHubFrame extends JFrame {
                     ? null
                     : authClient.authenticateHashed(session.username, session.passwordSha256);
 
-                if (result != null && result.success) {
+                if (result != null && result.success && !intentionalDisconnect) {
+                    session.certificateDetails = result.certificateDetails;
                     // Refresh the volatile session material issued by the auth server
                     session.sessionToken = result.sessionToken;
                     session.aesKeyBase64 = result.aesKeyBase64;
 
                     SocketChannel fresh = SocketChannel.open();
-                    fresh.connect(new InetSocketAddress(session.host, session.nioPort));
+                    fresh.socket().connect(new InetSocketAddress(session.host, session.nioPort), NetworkConfig.TCP_SOCKET_TIMEOUT_MS);
+                    if (intentionalDisconnect) { fresh.close(); return; }
+                    closeChannel();
                     nioChannel = fresh;
                     connected = true;
                     restored = true;
@@ -1168,6 +1176,7 @@ public class MainHubFrame extends JFrame {
             final boolean ok = restored;
             SwingUtilities.invokeLater(() -> {
                 reconnectInProgress = false;
+                if (intentionalDisconnect) { closeChannel(); return; }
                 if (ok) {
                     if (reconnectTimer != null) reconnectTimer.stop();
                     showReconnectBanner(false);
@@ -1203,7 +1212,7 @@ public class MainHubFrame extends JFrame {
                             try {
                                 displayContent = CryptoIntegrityService.decryptAes(content, session.aesKeyBase64);
                             } catch (Exception e) {
-                                displayContent = "[AES Decryption Error: " + e.getMessage() + "]";
+                                displayContent = "This older encrypted message is unavailable with the current workspace key.";
                             }
                         }
 
@@ -1220,11 +1229,12 @@ public class MainHubFrame extends JFrame {
                         if (room.equalsIgnoreCase(currentRoom)) {
                             membersModel.clear();
                             for (int i = 2; i < parts.length; i++) {
-                                String[] us = parts[i].split(":");
+                                String[] us = parts[i].split(":", -1);
                                 String u = us[0];
                                 String st = (us.length > 1) ? us[1] : ProtocolConstants.STATUS_ONLINE;
-                                String role = u.equalsIgnoreCase("admin") ? ProtocolConstants.ROLE_MODERATOR : ProtocolConstants.ROLE_STUDENT;
-                                membersModel.addElement(new MemberItem(u, st, role));
+                                String role = us.length > 2 ? us[2] : ProtocolConstants.ROLE_STUDENT;
+                                if (us.length > 3) memberNames.put(u, new String(java.util.Base64.getDecoder().decode(us[3]), java.nio.charset.StandardCharsets.UTF_8));
+                                membersModel.addElement(new MemberItem(u, st, role, memberNames.getOrDefault(u, u)));
                             }
                         }
                     }
@@ -1341,6 +1351,13 @@ public class MainHubFrame extends JFrame {
                     break;
                 }
 
+                case "PROFILE_UPDATED":
+                    if (parts.length >= 2) {
+                        session.displayName = DataPersistenceManager.decodeField(parts[1]);
+                        profileNameLabel.setText(session.displayName);
+                        ToastNotification.show(this, "Profile updated", "Your display name has been saved.", ToastNotification.Type.SUCCESS);
+                    }
+                    break;
                 case ProtocolConstants.EVT_SYSTEM:
                     if (parts.length >= 2) {
                         renderSystemNotice(parts[1]);
@@ -1378,7 +1395,7 @@ public class MainHubFrame extends JFrame {
                 try {
                     text = CryptoIntegrityService.decryptAes(entry.getPayload(), session.aesKeyBase64);
                 } catch (Exception e) {
-                    text = "[AES Decryption Error]";
+                    text = "This older encrypted message is unavailable with the current workspace key.";
                 }
             }
             renderChatMessageCard(entry.getSender(), text, entry.getTimestamp(),
@@ -1444,29 +1461,21 @@ public class MainHubFrame extends JFrame {
         return flat.length() <= max ? flat : flat.substring(0, max) + "...";
     }
 
-    private synchronized void sendNioFrame(String payload) {
-        if (!connected || nioChannel == null || !nioChannel.isOpen()) return;
-        try {
-            ByteBuffer buf = framer.frameMessage(payload);
-            while (buf.hasRemaining()) {
-                nioChannel.write(buf);
+    private void sendNioFrame(String payload) {
+        SocketChannel channel = nioChannel;
+        if (!connected || intentionalDisconnect || channel == null || !channel.isOpen()) return;
+        ByteBuffer buffer = framer.frameMessage(payload);
+        try { writes.execute(() -> {
+            try {
+                if (channel != nioChannel || intentionalDisconnect) return;
+                while (buffer.hasRemaining()) channel.write(buffer);
+                inspectorPanel.logEvent(new PacketLogEvent(PacketLogEvent.Module.NIO_SELECTOR,
+                    PacketLogEvent.Direction.TX, "Sent Framed Packet", payload.startsWith("HELLO|") ? "HELLO|[session redacted]" : payload,
+                    framer.getBufferInspectionSummary()));
+            } catch (IOException e) {
+                SwingUtilities.invokeLater(this::handleDisconnected);
             }
-            inspectorPanel.logEvent(new PacketLogEvent(
-                PacketLogEvent.Module.NIO_SELECTOR,
-                PacketLogEvent.Direction.TX,
-                "Sent Framed Packet",
-                payload,
-                framer.getBufferInspectionSummary()
-            ));
-        } catch (IOException e) {
-            inspectorPanel.logEvent(new PacketLogEvent(
-                PacketLogEvent.Module.NIO_SELECTOR,
-                PacketLogEvent.Direction.INTERNAL,
-                "Send Error",
-                e.getMessage()
-            ));
-            handleDisconnected();
-        }
+        }); } catch (java.util.concurrent.RejectedExecutionException ignored) { /* Window is closing. */ }
     }
 
     private void sendMessage() {
@@ -1507,6 +1516,11 @@ public class MainHubFrame extends JFrame {
             ? DataPersistenceManager.defaultRoomTopic(newRoom) : topic);
 
         chatFeedPanel.removeAll();
+        if (chatFeedPanel.getComponentCount() == 0) {
+            emptyRoom.setForeground(ThemeColors.TEXT_MUTED);
+            emptyRoom.setBorder(BorderFactory.createEmptyBorder(28, 20, 28, 20));
+            chatFeedPanel.add(emptyRoom);
+        }
         chatFeedPanel.add(chatFiller);
         chatFeedPanel.revalidate();
         chatFeedPanel.repaint();
@@ -1632,11 +1646,13 @@ public class MainHubFrame extends JFrame {
     private void runVaultSearch() {
         final String query = pendingVaultQuery;
         final List<SharedFileRecord> snapshot = new ArrayList<>(allRoomFiles);
+        final String room = currentRoom;
+        final long generation = ++vaultSearchGeneration;
         searchEngine.submit(() -> {
             try {
-                Future<List<SharedFileRecord>> inner = searchEngine.submitFileSearch(snapshot, query, currentRoom);
-                final List<SharedFileRecord> matches = inner.get();
+                final List<SharedFileRecord> matches = new com.studyhub.concurrent.FileSearchCallable(snapshot, query, room).call();
                 SwingUtilities.invokeLater(() -> {
+                    if (intentionalDisconnect || generation != vaultSearchGeneration || !room.equals(currentRoom)) return;
                     vaultModel.clear();
                     for (SharedFileRecord record : matches) {
                         vaultModel.addElement(record);
@@ -1668,7 +1684,10 @@ public class MainHubFrame extends JFrame {
 
     private void emitPresencePulse(String status) {
         long seq = pulseSeq.getAndIncrement();
-        PresencePulseService.sendClientPulse(session.host, session.pulsePort, seq, session.username, currentRoom, status);
+        if (intentionalDisconnect || !connected) return;
+        String room = currentRoom;
+        try { pulses.execute(() -> PresencePulseService.sendClientPulse(session.host, session.pulsePort, seq, session.username, room, status)); }
+        catch (java.util.concurrent.RejectedExecutionException ignored) { return; }
 
         inspectorPanel.logEvent(new PacketLogEvent(
             PacketLogEvent.Module.UDP_BEACON,
@@ -1685,7 +1704,7 @@ public class MainHubFrame extends JFrame {
 
     private void updateMemberStatus(String user, String status) {
         if (ProtocolConstants.STATUS_TYPING.equalsIgnoreCase(status) && !user.equalsIgnoreCase(session.username)) {
-            typingIndicatorLabel.setText("✍ " + user + " is typing...");
+            typingIndicatorLabel.setText(user + " is typing…");
             Timer resetTyping = new Timer(3000, e -> typingIndicatorLabel.setText(" "));
             resetTyping.setRepeats(false);
             resetTyping.start();
@@ -1694,7 +1713,7 @@ public class MainHubFrame extends JFrame {
         for (int i = 0; i < membersModel.size(); i++) {
             MemberItem m = membersModel.get(i);
             if (m.username.equalsIgnoreCase(user)) {
-                membersModel.set(i, new MemberItem(user, status, m.role));
+                membersModel.set(i, new MemberItem(user, status, m.role, m.displayName));
                 return;
             }
         }
@@ -1765,6 +1784,8 @@ public class MainHubFrame extends JFrame {
 
     /** Uploads one or more files with a live progress card in the chat feed. */
     private void uploadFiles(List<File> files) {
+        final String uploadRoom = currentRoom;
+        final boolean tamper = simulateTamperEnabled;
         for (File file : files) {
             // The card is built on the EDT (it may arrive from the drag & drop thread).
             final TransferCard[] holder = new TransferCard[1];
@@ -1777,7 +1798,7 @@ public class MainHubFrame extends JFrame {
             new Thread(() -> {
                 FileTransferClient client = new FileTransferClient(session.host, session.filePort,
                     session.sessionToken, inspectorPanel::logEvent);
-                FileTransferClient.TransferResult result = client.uploadFile(currentRoom, file, simulateTamperEnabled,
+                FileTransferClient.TransferResult result = client.uploadFile(uploadRoom, file, tamper,
                     (transferred, total) -> {
                         if (card != null) {
                             SwingUtilities.invokeLater(() -> card.setProgress(transferred, total));
@@ -1787,16 +1808,16 @@ public class MainHubFrame extends JFrame {
                 SwingUtilities.invokeLater(() -> {
                     if (card == null) return;
                     if (result.success) {
-                        card.complete("☑ Uploaded & SHA-256 verified • stored as " + result.storedFilename,
+                        card.complete("Uploaded · " + result.storedFilename,
                             ThemeColors.STATUS_ONLINE);
                         ToastNotification.show(MainHubFrame.this, "File Upload Verified",
                             file.getName() + " saved to the server vault.", ToastNotification.Type.SUCCESS);
                     } else if (result.tampered) {
-                        card.complete("✖ TAMPER DETECTED — server rejected the file", ThemeColors.STATUS_DANGER);
+                        card.complete("Integrity check failed — file rejected", ThemeColors.STATUS_DANGER);
                         ToastNotification.show(MainHubFrame.this, "TAMPER DETECTED",
                             "Server rejected upload! Computed: " + result.actualSha, ToastNotification.Type.ERROR);
                     } else {
-                        card.complete("✖ Upload failed: " + result.message, ThemeColors.STATUS_DANGER);
+                        card.complete("Upload failed: " + result.message, ThemeColors.STATUS_DANGER);
                         ToastNotification.show(MainHubFrame.this, "Upload Failed", result.message, ToastNotification.Type.ERROR);
                     }
                 });
@@ -1821,7 +1842,7 @@ public class MainHubFrame extends JFrame {
             SwingUtilities.invokeLater(() -> {
                 if (result.success) {
                     if (card != null) {
-                        card.complete("☑ Saved to downloads/" + session.username + "/"
+                        card.complete("Saved to downloads/" + session.username + "/"
                             + result.savedFile.getName(), ThemeColors.STATUS_ONLINE);
                         card.enableOpenActions(result.savedFile);
                     }
@@ -1829,7 +1850,7 @@ public class MainHubFrame extends JFrame {
                         "Saved to " + result.savedFile.getAbsolutePath(), ToastNotification.Type.SUCCESS);
                 } else {
                     if (card != null) {
-                        card.complete("✖ Download failed: " + result.message, ThemeColors.STATUS_DANGER);
+                        card.complete("Download failed: " + result.message, ThemeColors.STATUS_DANGER);
                     }
                     ToastNotification.show(MainHubFrame.this, "Download Failed", result.message, ToastNotification.Type.ERROR);
                 }
@@ -1922,13 +1943,13 @@ public class MainHubFrame extends JFrame {
                 JPanel metaRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
                 metaRow.setOpaque(false);
 
-                JLabel nameLbl = new JLabel(sender);
+                JLabel nameLbl = new JLabel(memberNames.getOrDefault(sender, sender));
                 nameLbl.setFont(ThemeColors.FONT_BOLD);
                 nameLbl.setForeground(sender.equalsIgnoreCase(session.username) ? ThemeColors.ACCENT_PRIMARY : ThemeColors.TEXT_PRIMARY);
 
                 String role = sender.equalsIgnoreCase("admin") ? "MOD" : "STUDENT";
                 JLabel roleTag = new JLabel(" " + role + " ");
-                roleTag.setFont(new Font("Segoe UI", Font.BOLD, 9));
+                roleTag.setFont(new Font("Dialog", Font.BOLD, 9));
                 roleTag.setForeground(ThemeColors.TEXT_DARK);
                 roleTag.setOpaque(true);
                 roleTag.setBackground(role.equals("MOD") ? ThemeColors.BADGE_MOD : ThemeColors.BADGE_STUDENT);
@@ -1938,12 +1959,13 @@ public class MainHubFrame extends JFrame {
                 timeLbl.setForeground(ThemeColors.TEXT_MUTED);
 
                 metaRow.add(nameLbl);
-                metaRow.add(roleTag);
+                if (role.equals("MOD")) metaRow.add(roleTag);
                 metaRow.add(timeLbl);
 
                 if (aes) {
-                    JLabel aesPill = new JLabel(" 🔒 AES-128 ");
-                    aesPill.setFont(new Font("Segoe UI", Font.BOLD, 9));
+                    JLabel aesPill = new JLabel(new VectorIcon(VectorIcon.Kind.LOCK, 12, ThemeColors.STATUS_ONLINE));
+                    aesPill.setToolTipText("Encrypted workspace message");
+                    aesPill.setFont(new Font("Dialog", Font.BOLD, 9));
                     aesPill.setForeground(ThemeColors.STATUS_ONLINE);
                     aesPill.setOpaque(true);
                     aesPill.setBackground(ThemeColors.BG_INPUT);
@@ -2063,7 +2085,7 @@ public class MainHubFrame extends JFrame {
         }
 
         private void renderText(String query) {
-            textLabel.setText("<html><body style='width: 560px; color: #f2f3f5; font-family: Segoe UI; font-size: 13px;'>"
+            textLabel.setText("<html><body style='width: 560px; color: #f2f3f5; font-family: Dialog; font-size: 13px;'>"
                 + highlightHtml(text, query) + "</body></html>");
         }
 
@@ -2100,13 +2122,13 @@ public class MainHubFrame extends JFrame {
         topRow.setOpaque(false);
 
         JLabel badge = new JLabel(" HTTP PREVIEW ");
-        badge.setFont(new Font("Segoe UI", Font.BOLD, 9));
+        badge.setFont(new Font("Dialog", Font.BOLD, 9));
         badge.setForeground(ThemeColors.ACCENT_PRIMARY);
         badge.setOpaque(true);
         badge.setBackground(ThemeColors.BG_INPUT);
 
         JLabel statusPill = new JLabel(" " + status + " ");
-        statusPill.setFont(new Font("Segoe UI", Font.BOLD, 9));
+        statusPill.setFont(new Font("Dialog", Font.BOLD, 9));
         statusPill.setForeground(ThemeColors.STATUS_ONLINE);
         statusPill.setOpaque(true);
         statusPill.setBackground(ThemeColors.BG_INPUT);
@@ -2177,8 +2199,14 @@ public class MainHubFrame extends JFrame {
 
     /** Adds a card just above the bottom glue so cards keep their natural height. */
     private void appendCard(JComponent card) {
+        if (card instanceof MessageCard || card instanceof TransferCard) chatFeedPanel.remove(emptyRoom);
         chatFeedPanel.remove(chatFiller);
         chatFeedPanel.add(card);
+        if (chatFeedPanel.getComponentCount() == 0) {
+            emptyRoom.setForeground(ThemeColors.TEXT_MUTED);
+            emptyRoom.setBorder(BorderFactory.createEmptyBorder(28, 20, 28, 20));
+            chatFeedPanel.add(emptyRoom);
+        }
         chatFeedPanel.add(chatFiller);
         chatFeedPanel.revalidate();
         scrollToBottom();
@@ -2224,8 +2252,8 @@ public class MainHubFrame extends JFrame {
                 BorderFactory.createEmptyBorder(8, 14, 8, 14)
             ));
 
-            JLabel iconLbl = new JLabel("📄");
-            iconLbl.setFont(new Font("Segoe UI", Font.PLAIN, 28));
+            JLabel iconLbl = new JLabel(new VectorIcon(VectorIcon.Kind.FILE, 28, ThemeColors.TEXT_MUTED));
+            iconLbl.setFont(new Font("Dialog", Font.PLAIN, 28));
 
             JPanel infoPanel = new JPanel();
             infoPanel.setLayout(new BoxLayout(infoPanel, BoxLayout.Y_AXIS));
@@ -2238,7 +2266,7 @@ public class MainHubFrame extends JFrame {
 
             statusLabel.setFont(ThemeColors.FONT_MUTED);
             statusLabel.setForeground(ThemeColors.TEXT_MUTED);
-            statusLabel.setText(upload ? "⬆ Uploading over TCP FileChannel..." : "Shared in this room");
+            statusLabel.setText(upload ? "Uploading…" : "Shared in this room");
 
             progressBar.setStringPainted(true);
             progressBar.setFont(ThemeColors.FONT_MUTED);
@@ -2286,7 +2314,7 @@ public class MainHubFrame extends JFrame {
             actionBtn.addActionListener(e -> {
                 actionBtn.setEnabled(false);
                 progressBar.setVisible(true);
-                statusLabel.setText("⬇ Downloading over TCP FileChannel...");
+                statusLabel.setText("Downloading…");
                 action.run();
             });
         }
@@ -2344,20 +2372,71 @@ public class MainHubFrame extends JFrame {
     // =========================================================================
     // TLS CERTIFICATE DIALOG
     // =========================================================================
+    private void showInviteDialog() {
+        JDialog dialog = new JDialog(this, "Invite to " + session.workspaceName, true);
+        JPanel body = new JPanel(new BorderLayout(12, 16)); body.setBorder(BorderFactory.createEmptyBorder(24, 24, 24, 24));
+        body.add(new JLabel("Ask your friend to join this workspace on the same Wi-Fi."), BorderLayout.NORTH);
+        JTextField ip = new JTextField(com.studyhub.common.LanAddresses.preferredAddress()); ip.setEditable(false); ip.setFont(ThemeColors.FONT_TITLE);
+        body.add(ip, BorderLayout.CENTER);
+        PillButton copy = new PillButton("Copy Address");
+        copy.addActionListener(e -> { Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new java.awt.datatransfer.StringSelection(ip.getText()), null); copy.setText("Copied"); });
+        body.add(copy, BorderLayout.SOUTH); dialog.setContentPane(body); dialog.pack(); dialog.setLocationRelativeTo(this); dialog.setVisible(true);
+    }
+
+    private void showSettingsDialog() {
+        JDialog dialog = new JDialog(this, "Workspace Settings", true);
+        JPanel body = new JPanel(); body.setLayout(new BoxLayout(body, BoxLayout.Y_AXIS));
+        body.setBorder(BorderFactory.createEmptyBorder(24, 24, 24, 24));
+        JLabel title = new JLabel("Your profile"); title.setFont(ThemeColors.FONT_TITLE.deriveFont(20f)); body.add(title);
+        body.add(Box.createVerticalStrut(16));
+        JLabel name = new JLabel("Display name"); body.add(name);
+        JTextField display = new JTextField(session.displayName, 30); name.setLabelFor(display); display.setFont(ThemeColors.FONT_BODY);
+        display.setMaximumSize(new Dimension(Integer.MAX_VALUE, 36)); body.add(display);
+        body.add(Box.createVerticalStrut(12)); body.add(new JLabel("Study status"));
+        JComboBox<String> status = new JComboBox<>(new String[]{"Available", "Focusing / Do Not Disturb", "In Lab"});
+        for (int i = 0; i < ProtocolConstants.SELECTABLE_STATUSES.length; i++) if (currentStatus.equals(ProtocolConstants.SELECTABLE_STATUSES[i])) status.setSelectedIndex(i);
+        status.setMaximumSize(new Dimension(Integer.MAX_VALUE, 36)); body.add(status);
+        JLabel error = new JLabel(" "); error.setForeground(ThemeColors.STATUS_DANGER); body.add(error);
+        PillButton save = new PillButton("Save Profile");
+        save.addActionListener(e -> {
+            String value = display.getText().trim();
+            if (value.isEmpty() || value.length() > 48) { error.setText("Use a display name with 1–48 characters."); return; }
+            if (!connected) { error.setText("Reconnect to the workspace before saving."); return; }
+            sendNioFrame("UPDATE_PROFILE|" + DataPersistenceManager.encodeField(value));
+            currentStatus = ProtocolConstants.SELECTABLE_STATUSES[status.getSelectedIndex()]; emitPresencePulse(currentStatus); dialog.dispose();
+        }); body.add(save); body.add(Box.createVerticalStrut(20));
+        PillButton downloads = new PillButton("Open Downloads", ThemeColors.BG_INPUT, ThemeColors.BG_HOVER, ThemeColors.TEXT_PRIMARY, 10);
+        downloads.setIcon(new VectorIcon(VectorIcon.Kind.FOLDER, 16, ThemeColors.TEXT_MUTED)); downloads.addActionListener(e -> openDownloadsFolder()); body.add(downloads);
+        body.add(Box.createVerticalStrut(8));
+        PillButton security = new PillButton("Connection Security", ThemeColors.BG_INPUT, ThemeColors.BG_HOVER, ThemeColors.TEXT_PRIMARY, 10);
+        security.setIcon(new VectorIcon(VectorIcon.Kind.LOCK, 16, ThemeColors.STATUS_ONLINE)); security.addActionListener(e -> showTlsCertDialog()); body.add(security);
+        body.add(Box.createVerticalStrut(16));
+        javax.swing.JCheckBox diagnostics = new javax.swing.JCheckBox("Developer Diagnostics", inspectorExpanded);
+        diagnostics.addActionListener(e -> setDiagnostics(diagnostics.isSelected())); body.add(diagnostics);
+        body.add(Box.createVerticalStrut(16));
+        PillButton logout = new PillButton("Log Out / Switch Workspace", ThemeColors.BG_INPUT, ThemeColors.BG_HOVER, ThemeColors.STATUS_DANGER, 10);
+        logout.addActionListener(e -> { dialog.dispose(); switchUser(); }); body.add(logout);
+        for (Component child : body.getComponents()) if (child instanceof JComponent component) component.setAlignmentX(0);
+        dialog.setContentPane(body); dialog.getRootPane().setDefaultButton(save); dialog.pack(); dialog.setLocationRelativeTo(this); dialog.setVisible(true);
+    }
+
     private void showTlsCertDialog() {
         TlsAuthClient.CertificateDetails cert = session.certificateDetails;
         if (cert == null) return;
 
-        JDialog dialog = new JDialog(this, "TLSv1.3 Security & X.509 Certificate Details", true);
-        dialog.setSize(520, 340);
+        JDialog dialog = new JDialog(this, "Connection & Certificate Info", true);
+        dialog.setSize(720, 460);
         dialog.setLocationRelativeTo(this);
         dialog.getContentPane().setBackground(ThemeColors.BG_PANEL);
         dialog.setLayout(new BorderLayout());
 
-        JPanel p = new JPanel(new GridLayout(6, 1, 6, 6));
+        JPanel p = new JPanel(new GridLayout(9, 1, 6, 6));
         p.setBackground(ThemeColors.BG_PANEL);
         p.setBorder(BorderFactory.createEmptyBorder(16, 20, 16, 20));
 
+        p.add(createCertField("Workspace address:", session.host));
+        p.add(createCertField("Trust:", "TOFU · saved certificate pin · compare with host on first connection"));
+        p.add(createCertField("Message encryption:", "Shared workspace AES key (host-managed, not end-to-end)"));
         p.add(createCertField("Negotiated Protocol:", cert.protocol));
         p.add(createCertField("Cipher Suite:", cert.cipherSuite));
         p.add(createCertField("Subject DN:", cert.subjectDN));
@@ -2384,7 +2463,8 @@ public class MainHubFrame extends JFrame {
         l.setFont(ThemeColors.FONT_BOLD);
         l.setForeground(ThemeColors.TEXT_MUTED);
 
-        JLabel v = new JLabel(val);
+        JTextField v = new JTextField(val); v.setEditable(false); v.setBorder(null);
+        v.setBackground(ThemeColors.BG_PANEL); v.setToolTipText(val);
         v.setFont(ThemeColors.FONT_MONO);
         v.setForeground(ThemeColors.TEXT_PRIMARY);
 
@@ -2410,7 +2490,7 @@ public class MainHubFrame extends JFrame {
             setBorder(BorderFactory.createEmptyBorder(4, 6, 4, 6));
 
             nameLbl.setFont(ThemeColors.FONT_HEADER);
-            roleLbl.setFont(new Font("Segoe UI", Font.BOLD, 9));
+            roleLbl.setFont(new Font("Dialog", Font.BOLD, 9));
             statusLbl.setFont(ThemeColors.FONT_MUTED);
 
             JPanel textP = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
@@ -2434,7 +2514,7 @@ public class MainHubFrame extends JFrame {
         @Override
         public Component getListCellRendererComponent(JList<? extends MemberItem> list, MemberItem item, int index, boolean isSelected, boolean cellHasFocus) {
             setBackground(isSelected ? ThemeColors.BG_HOVER : ThemeColors.BG_PANEL);
-            nameLbl.setText(item.username);
+            nameLbl.setText(item.displayName);
             nameLbl.setForeground(ThemeColors.TEXT_PRIMARY);
 
             Color dotColor;
@@ -2490,7 +2570,8 @@ public class MainHubFrame extends JFrame {
         @Override
         public Component getListCellRendererComponent(JList<? extends SharedFileRecord> list, SharedFileRecord record, int index, boolean isSelected, boolean cellHasFocus) {
             setBackground(isSelected ? ThemeColors.BG_HOVER : ThemeColors.BG_PANEL);
-            nameLbl.setText("📄 " + record.getFilename());
+            nameLbl.setText(record.getFilename());
+            nameLbl.setIcon(new VectorIcon(VectorIcon.Kind.FILE, 16, ThemeColors.TEXT_MUTED));
             metaLbl.setText(record.getFormattedSize() + " • " + record.getUploader() + " • " + record.getTimestamp());
             String ext = record.getExtension();
             setToolTipText("Click to download • Double-click to download and open"

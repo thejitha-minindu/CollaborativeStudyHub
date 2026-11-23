@@ -1,3 +1,7 @@
 #!/usr/bin/env bash
-echo "Starting Collaborative Study Hub Client GUI..."
-java -cp out com.studyhub.ui.StudyHubClientMain
+set -e
+cd -- "$(dirname -- "$0")"
+if [ ! -f out/com/studyhub/ui/StudyHubClientMain.class ]; then
+    bash build.sh
+fi
+exec java -cp out com.studyhub.ui.StudyHubClientMain "$@"

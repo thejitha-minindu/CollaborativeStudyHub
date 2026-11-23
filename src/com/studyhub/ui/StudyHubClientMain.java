@@ -10,6 +10,22 @@ import javax.swing.UIManager;
  * brings the login portal back up, so several group members can share one machine.
  */
 public class StudyHubClientMain {
+    private static com.studyhub.server.StudyHubServerMain embeddedServer;
+    private static String hostedName;
+
+    /** Called only from the onboarding worker, never from the Swing event thread. */
+    public static synchronized String hostWorkspace(String name, NetworkInspectorPanel inspector) throws Exception {
+        if (embeddedServer == null) {
+            com.studyhub.server.StudyHubServerMain candidate = new com.studyhub.server.StudyHubServerMain(name, inspector::logEvent);
+            candidate.start(); // Transactional startup cleans up every bound service on failure.
+            embeddedServer = candidate;
+            hostedName = name;
+        }
+        return com.studyhub.common.LanAddresses.preferredAddress();
+    }
+
+    public static synchronized String hostedWorkspaceName() { return hostedName; }
+
 
     public static void main(String[] args) {
         SwingUtilities.invokeLater(() -> {
@@ -18,6 +34,7 @@ public class StudyHubClientMain {
                 UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
             } catch (Exception ignored) {}
 
+            com.studyhub.ui.theme.ThemeColors.installDefaults();
             launchSession(new NetworkInspectorPanel());
         });
     }

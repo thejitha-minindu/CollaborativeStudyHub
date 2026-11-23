@@ -1,5 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
+cd /d "%~dp0"
 
 set JAVA_CMD=java
 if exist "%JAVA_HOME%\bin\java.exe" (
@@ -10,5 +11,11 @@ if exist "%JAVA_HOME%\bin\java.exe" (
     )
 )
 
-echo Starting Collaborative Study Hub Server...
-"%JAVA_CMD%" -cp out com.studyhub.server.StudyHubServerMain
+if not exist out\com\studyhub\server\StudyHubServerMain.class (
+    call build.bat
+    if errorlevel 1 exit /b 1
+)
+
+echo Starting StudyHub workspace server...
+"%JAVA_CMD%" -cp out com.studyhub.server.StudyHubServerMain %*
+exit /b %ERRORLEVEL%

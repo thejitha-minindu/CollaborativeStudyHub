@@ -15,7 +15,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 public class ClientChannelContext {
 
     private final SocketChannel channel;
-    private final ByteBuffer readBuffer;
+    private ByteBuffer readBuffer;
     private final Queue<ByteBuffer> outboundQueue;
 
     private volatile String username;
@@ -37,6 +37,7 @@ public class ClientChannelContext {
     }
 
     public ByteBuffer getReadBuffer() {
+        readBuffer = MessageFramer.ensureWritable(readBuffer);
         return readBuffer;
     }
 

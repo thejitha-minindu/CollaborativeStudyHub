@@ -66,6 +66,7 @@ public class PresencePulseService {
 
         while (running && serverSocket != null && !serverSocket.isClosed()) {
             try {
+                packet.setLength(buffer.length);
                 serverSocket.receive(packet);
                 String raw = new String(packet.getData(), packet.getOffset(), packet.getLength(), StandardCharsets.UTF_8);
                 handleIncomingPulse(raw);
@@ -92,7 +93,11 @@ public class PresencePulseService {
                 String room = parts[3].trim();
                 String status = parts[4].trim();
 
-                Long lastSeq = lastSequenceByUser.get(username.toLowerCase());
+                SafeRoomRegistry.UserSession session = registry.getSessionByUsername(username);
+                if (session == null || !session.getCurrentRoom().equalsIgnoreCase(room)) return;
+                String sequenceKey = session.getSessionToken();
+                lastSequenceByUser.keySet().removeIf(token -> registry.getSessionByToken(token) == null);
+                Long lastSeq = lastSequenceByUser.get(sequenceKey);
                 if (lastSeq != null && seqNum <= lastSeq) {
                     // Out-of-Order or duplicate packet detected!
                     telemetrySink.accept(new PacketLogEvent(
@@ -105,9 +110,8 @@ public class PresencePulseService {
                 }
 
                 // Monotonic progression: accept and update
-                lastSequenceByUser.put(username.toLowerCase(), seqNum);
+                lastSequenceByUser.put(sequenceKey, seqNum);
 
-                SafeRoomRegistry.UserSession session = registry.getSessionByUsername(username);
                 if (session != null) {
                     session.setPresenceStatus(status);
                     session.updatePulseTimestamp();

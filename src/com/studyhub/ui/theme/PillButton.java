@@ -122,11 +122,18 @@ public class PillButton extends JButton {
         g2.setFont(getFont());
         g2.setColor(isEnabled() ? textColor : ThemeColors.TEXT_MUTED);
         FontMetrics fm = g2.getFontMetrics();
-        int stringWidth = fm.stringWidth(getText());
-        int stringHeight = fm.getAscent();
-        int x = (w - stringWidth) / 2;
-        int y = (h + stringHeight) / 2 - 2;
-        g2.drawString(getText(), x, y);
+        String text = getText() == null ? "" : getText();
+        javax.swing.Icon icon = getIcon();
+        int gap = icon != null && !text.isEmpty() ? 8 : 0;
+        int iconWidth = icon != null ? icon.getIconWidth() : 0;
+        int totalWidth = fm.stringWidth(text) + iconWidth + gap;
+        int x = (w - totalWidth) / 2;
+        if (icon != null) icon.paintIcon(this, g2, x, (h - icon.getIconHeight()) / 2);
+        g2.drawString(text, x + iconWidth + gap, (h - fm.getHeight()) / 2 + fm.getAscent());
+        if (hasFocus()) {
+            g2.setColor(ThemeColors.BORDER_ACTIVE);
+            g2.drawRoundRect(2, 2, w - 5, h - 5, cornerRadius, cornerRadius);
+        }
 
         g2.dispose();
     }

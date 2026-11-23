@@ -1,6 +1,7 @@
 package com.studyhub.udp;
 
 import com.studyhub.common.NetworkConfig;
+import com.studyhub.common.LanAddresses;
 import com.studyhub.common.PacketLogEvent;
 import com.studyhub.common.ProtocolConstants;
 import com.studyhub.concurrent.SafeRoomRegistry;
@@ -56,33 +57,22 @@ public class LanDiscoveryBroadcaster {
                 long seq = sequenceNumber.getAndIncrement();
                 int activeUsers = (registry != null) ? registry.getActiveUserCount() : 0;
 
-                // Wire format: BEACON|<seqNum>|<hubName>|<tlsPort>|<nioPort>|<filePort>|<pulsePort>|<activeUsers>
-                String payload = String.format("%s|%d|%s|%d|%d|%d|%d|%d",
-                    ProtocolConstants.UDP_BEACON_HEADER,
-                    seq,
-                    hubName,
-                    NetworkConfig.TLS_AUTH_PORT,
-                    NetworkConfig.NIO_CHAT_PORT,
-                    NetworkConfig.FILE_TRANSFER_PORT,
-                    NetworkConfig.UDP_PULSE_PORT,
-                    activeUsers
-                );
-
-                byte[] data = payload.getBytes(StandardCharsets.UTF_8);
-
-                // 1. Send to 255.255.255.255 LAN Broadcast
-                try {
-                    InetAddress broadcastAddr = InetAddress.getByName(NetworkConfig.BROADCAST_IP);
-                    DatagramPacket packet = new DatagramPacket(data, data.length, broadcastAddr, NetworkConfig.UDP_DISCOVERY_PORT);
-                    socket.send(packet);
-                } catch (Exception ignored) {}
-
-                // 2. Send to 127.0.0.1 Localhost (ensures guaranteed single-machine lab evaluation)
-                try {
-                    InetAddress localAddr = InetAddress.getByName(NetworkConfig.LOCALHOST_IP);
-                    DatagramPacket localPacket = new DatagramPacket(data, data.length, localAddr, NetworkConfig.UDP_DISCOVERY_PORT);
-                    socket.send(localPacket);
-                } catch (Exception ignored) {}
+                // Extend the original eight fields with the advertised IPv4 (old clients remain compatible).
+                String preferred = LanAddresses.preferredAddress();
+                for (LanAddresses.Adapter adapter : LanAddresses.active()) {
+                    if (adapter.broadcast() == null) continue;
+                    // Bind the sender to this adapter so multi-homed hosts announce a reachable source.
+                    try (DatagramSocket directed = new DatagramSocket(new java.net.InetSocketAddress(adapter.address(), 0))) {
+                        directed.setBroadcast(true);
+                        sendBeacon(directed, adapter.broadcast(), seq, activeUsers, adapter.address().getHostAddress());
+                    } catch (Exception ignored) { /* Continue with the remaining adapters. */ }
+                }
+                String payload = beacon(seq, activeUsers, preferred);
+                for (String destination : new String[]{NetworkConfig.BROADCAST_IP, NetworkConfig.LOCALHOST_IP}) {
+                    try {
+                        sendBeacon(socket, InetAddress.getByName(destination), seq, activeUsers, preferred);
+                    } catch (Exception ignored) { /* A blocked broadcast must not prevent local discovery. */ }
+                }
 
                 telemetrySink.accept(new PacketLogEvent(
                     PacketLogEvent.Module.UDP_BEACON,
@@ -106,6 +96,17 @@ public class LanDiscoveryBroadcaster {
                 }
             }
         }
+    }
+
+    private String beacon(long seq, int users, String ip) {
+        return String.format("%s|%d|%s|%d|%d|%d|%d|%d|%s", ProtocolConstants.UDP_BEACON_HEADER,
+            seq, hubName.replace('|', ' ').replace('\n', ' ').replace('\r', ' '), NetworkConfig.TLS_AUTH_PORT,
+            NetworkConfig.NIO_CHAT_PORT, NetworkConfig.FILE_TRANSFER_PORT, NetworkConfig.UDP_PULSE_PORT, users, ip);
+    }
+
+    private void sendBeacon(DatagramSocket sender, InetAddress destination, long seq, int users, String ip) throws Exception {
+        byte[] data = beacon(seq, users, ip).getBytes(StandardCharsets.UTF_8);
+        sender.send(new DatagramPacket(data, data.length, destination, NetworkConfig.UDP_DISCOVERY_PORT));
     }
 
     public void stop() {

@@ -5,10 +5,8 @@ import com.studyhub.common.NetworkConfig;
 import com.studyhub.common.PacketLogEvent;
 import com.studyhub.common.ProtocolConstants;
 import com.studyhub.security.CryptoIntegrityService;
-import java.io.BufferedReader;
 import java.io.File;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.PrintWriter;
 import java.net.Socket;
@@ -72,7 +70,8 @@ public class FileTransferClient {
     private final Consumer<PacketLogEvent> telemetrySink;
 
     public FileTransferClient(String host, int port, String sessionToken, Consumer<PacketLogEvent> telemetrySink) {
-        this.host = host != null ? host : NetworkConfig.DEFAULT_HOST;
+        if (host == null || host.isBlank()) throw new IllegalArgumentException("Select a workspace address first");
+        this.host = host.trim();
         this.port = port > 0 ? port : NetworkConfig.FILE_TRANSFER_PORT;
         this.sessionToken = sessionToken != null ? sessionToken : "";
         this.telemetrySink = telemetrySink != null ? telemetrySink : e -> {};
@@ -109,19 +108,19 @@ public class FileTransferClient {
 
         long fileSize = file.length();
         String localSha256;
-        try {
-            localSha256 = CryptoIntegrityService.computeSha256(Files.readAllBytes(file.toPath()));
+        try (InputStream source = Files.newInputStream(file.toPath())) {
+            localSha256 = CryptoIntegrityService.computeSha256(source);
         } catch (Exception e) {
             return TransferResult.fail("Failed to compute local SHA-256: " + e.getMessage());
         }
 
-        try (Socket socket = new Socket(host, port)) {
+        try (Socket socket = new Socket()) {
+            socket.connect(new java.net.InetSocketAddress(host, port), NetworkConfig.TCP_SOCKET_TIMEOUT_MS);
             socket.setSoTimeout(NetworkConfig.TCP_SOCKET_TIMEOUT_MS);
             OutputStream out = socket.getOutputStream();
             InputStream in = socket.getInputStream();
 
             PrintWriter writer = new PrintWriter(out, true, StandardCharsets.UTF_8);
-            BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
 
             // Header line
             String header = String.format("%s|%s|%s|%s|%d|%s|%b",
@@ -171,7 +170,7 @@ public class FileTransferClient {
             }
 
             // Read server verification response
-            String response = reader.readLine();
+            String response = FileTransferServer.readHeaderLine(in);
             if (response == null) {
                 return TransferResult.fail("Server closed connection during upload");
             }
@@ -248,20 +247,21 @@ public class FileTransferClient {
             ? forcedDestination
             : FileNameUtils.uniqueFile(dir, filename);
 
-        try (Socket socket = new Socket(host, port)) {
+        java.nio.file.Path pendingDownload = null;
+        try (Socket socket = new Socket()) {
+            socket.connect(new java.net.InetSocketAddress(host, port), NetworkConfig.TCP_SOCKET_TIMEOUT_MS);
             socket.setSoTimeout(NetworkConfig.TCP_SOCKET_TIMEOUT_MS);
             OutputStream out = socket.getOutputStream();
             InputStream in = socket.getInputStream();
 
             PrintWriter writer = new PrintWriter(out, true, StandardCharsets.UTF_8);
-            BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
 
             // Request header
             writer.println(ProtocolConstants.CMD_DOWNLOAD + ProtocolConstants.DELIMITER +
                 sessionToken + ProtocolConstants.DELIMITER + room + ProtocolConstants.DELIMITER
                 + FileNameUtils.sanitizeName(filename));
 
-            String headerLine = reader.readLine();
+            String headerLine = FileTransferServer.readHeaderLine(in);
             if (headerLine == null) {
                 return TransferResult.fail("Empty response from file server");
             }
@@ -274,7 +274,9 @@ public class FileTransferClient {
             long fileSize = Long.parseLong(parts[1]);
             String expectedSha256 = parts[2].trim().toLowerCase();
 
-            File tempFile = File.createTempFile("studyhub_dl_", ".tmp");
+            if (fileSize < 0) throw new java.io.IOException("Invalid file length");
+            File tempFile = File.createTempFile("studyhub_dl_", ".tmp", dir);
+            pendingDownload = tempFile.toPath();
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             ByteBuffer buffer = ByteBuffer.allocate(NetworkConfig.FILE_CHUNK_SIZE);
 
@@ -297,7 +299,7 @@ public class FileTransferClient {
                     buffer.clear();
                     buffer.put(chunk, 0, read);
                     buffer.flip();
-                    fileChannel.write(buffer);
+                    while (buffer.hasRemaining()) fileChannel.write(buffer);
 
                     totalBytesRead += read;
                     if (listener != null) {
@@ -308,7 +310,7 @@ public class FileTransferClient {
 
             String computedSha256 = CryptoIntegrityService.bytesToHex(digest.digest()).toLowerCase();
 
-            if (!expectedSha256.equalsIgnoreCase(computedSha256)) {
+            if (totalBytesRead != fileSize || !expectedSha256.equalsIgnoreCase(computedSha256)) {
                 tempFile.delete();
                 telemetrySink.accept(new PacketLogEvent(
                     PacketLogEvent.Module.TLS_SECURITY,
@@ -320,6 +322,7 @@ public class FileTransferClient {
             }
 
             Files.move(tempFile.toPath(), destFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            pendingDownload = null;
 
             telemetrySink.accept(new PacketLogEvent(
                 PacketLogEvent.Module.TCP_FILECHANNEL,
@@ -339,6 +342,8 @@ public class FileTransferClient {
                 e.getMessage()
             ));
             return TransferResult.fail(e.getMessage());
+        } finally {
+            if (pendingDownload != null) try { Files.deleteIfExists(pendingDownload); } catch (java.io.IOException ignored) {}
         }
     }
 }

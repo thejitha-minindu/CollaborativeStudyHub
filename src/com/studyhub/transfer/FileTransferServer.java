@@ -111,7 +111,7 @@ public class FileTransferServer {
      * A {@code BufferedReader} is deliberately avoided here: it would read ahead into the
      * binary payload that follows the header and the upload would silently stall.
      */
-    private static String readHeaderLine(InputStream in) throws IOException {
+    static String readHeaderLine(InputStream in) throws IOException {
         ByteArrayOutputStream buffer = new ByteArrayOutputStream(256);
         int c;
         while ((c = in.read()) != -1) {
@@ -119,6 +119,7 @@ public class FileTransferServer {
                 return new String(buffer.toByteArray(), StandardCharsets.UTF_8);
             }
             if (c != '\r') {
+                if (buffer.size() >= 8192) throw new IOException("Transfer header is too long");
                 buffer.write(c);
             }
         }
@@ -127,6 +128,7 @@ public class FileTransferServer {
 
     private void handleTransferSession(Socket socket) {
         try (socket) {
+            socket.setSoTimeout(NetworkConfig.TCP_SOCKET_TIMEOUT_MS);
             InputStream in = socket.getInputStream();
             OutputStream out = socket.getOutputStream();
 
@@ -169,6 +171,9 @@ public class FileTransferServer {
         long fileSize = Long.parseLong(parts[4]);
         String expectedSha256 = parts[5].trim().toLowerCase();
         boolean simulateTamper = Boolean.parseBoolean(parts[6]);
+        if (fileSize < 0 || !expectedSha256.matches("[a-fA-F0-9]{64}")) {
+            writer.println(ProtocolConstants.RESP_UPLOAD_FAIL + "|Invalid file size or digest"); return;
+        }
 
         SafeRoomRegistry.UserSession session = registry.getSessionByToken(sessionToken);
         String uploader = (session != null) ? session.getUsername() : "Anonymous";
@@ -206,7 +211,7 @@ public class FileTransferServer {
                 buffer.clear();
                 buffer.put(byteBuf, 0, read);
                 buffer.flip();
-                fileChannel.write(buffer);
+                while (buffer.hasRemaining()) fileChannel.write(buffer);
 
                 totalBytesRead += read;
                 chunkCount++;
@@ -224,7 +229,7 @@ public class FileTransferServer {
         ));
 
         // Integrity verification step
-        if (!expectedSha256.equalsIgnoreCase(actualSha256)) {
+        if (totalBytesRead != fileSize || !expectedSha256.equalsIgnoreCase(actualSha256)) {
             tempFile.delete();
             writer.println(ProtocolConstants.RESP_UPLOAD_TAMPERED + ProtocolConstants.DELIMITER + expectedSha256 + ProtocolConstants.DELIMITER + actualSha256);
 
@@ -299,7 +304,8 @@ public class FileTransferServer {
         }
 
         long fileSize = targetFile.length();
-        String sha256 = CryptoIntegrityService.computeSha256(Files.readAllBytes(targetFile.toPath()));
+        String sha256;
+        try (InputStream source = Files.newInputStream(targetFile.toPath())) { sha256 = CryptoIntegrityService.computeSha256(source); }
 
         // Send confirmation header
         writer.println(ProtocolConstants.RESP_DOWNLOAD_OK + ProtocolConstants.DELIMITER + fileSize + ProtocolConstants.DELIMITER + sha256);
@@ -333,7 +339,7 @@ public class FileTransferServer {
     private static String sanitizeRoomDir(String room) {
         String cleaned = room == null ? "general" : room.replace("#", "");
         cleaned = cleaned.replaceAll("[^A-Za-z0-9._\\-]", "_");
-        return cleaned.isEmpty() ? "general" : cleaned;
+        return cleaned.isEmpty() || cleaned.equals(".") || cleaned.equals("..") ? "general" : cleaned;
     }
 
     public void stop() {

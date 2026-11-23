@@ -36,11 +36,31 @@ public final class ThemeColors {
     public static final Color BORDER_ACTIVE = new Color(0x58, 0x65, 0xF2);   // Focus border
 
     // Standard Typography
-    public static final Font FONT_TITLE = new Font("Segoe UI", Font.BOLD, 15);
-    public static final Font FONT_HEADER = new Font("Segoe UI", Font.BOLD, 13);
-    public static final Font FONT_BODY = new Font("Segoe UI", Font.PLAIN, 13);
-    public static final Font FONT_MUTED = new Font("Segoe UI", Font.PLAIN, 11);
-    public static final Font FONT_BOLD = new Font("Segoe UI", Font.BOLD, 11);
-    public static final Font FONT_MONO = new Font("Consolas", Font.PLAIN, 11);
-    public static final Font FONT_AVATAR = new Font("Segoe UI", Font.BOLD, 12);
+    public static final Font FONT_TITLE = new Font("Dialog", Font.BOLD, 15);
+    public static final Font FONT_HEADER = new Font("Dialog", Font.BOLD, 13);
+    public static final Font FONT_BODY = new Font("Dialog", Font.PLAIN, 13);
+    public static final Font FONT_MUTED = new Font("Dialog", Font.PLAIN, 11);
+    public static final Font FONT_BOLD = new Font("Dialog", Font.BOLD, 11);
+    public static final Font FONT_MONO = new Font("Monospaced", Font.PLAIN, 11);
+    public static final Font FONT_AVATAR = new Font("Dialog", Font.BOLD, 12);
+    public static void installDefaults() {
+        javax.swing.UIManager.put("Panel.background", BG_PANEL);
+        javax.swing.UIManager.put("OptionPane.background", BG_PANEL);
+        javax.swing.UIManager.put("OptionPane.messageForeground", TEXT_PRIMARY);
+        javax.swing.UIManager.put("Label.foreground", TEXT_PRIMARY);
+        javax.swing.UIManager.put("TextField.background", BG_INPUT);
+        javax.swing.UIManager.put("TextField.foreground", TEXT_PRIMARY);
+        javax.swing.UIManager.put("TextField.caretForeground", TEXT_PRIMARY);
+        javax.swing.UIManager.put("PasswordField.background", BG_INPUT);
+        javax.swing.UIManager.put("PasswordField.foreground", TEXT_PRIMARY);
+        javax.swing.UIManager.put("PasswordField.caretForeground", TEXT_PRIMARY);
+        javax.swing.UIManager.put("CheckBox.background", BG_PANEL);
+        javax.swing.UIManager.put("CheckBox.foreground", TEXT_PRIMARY);
+        javax.swing.UIManager.put("ComboBox.background", BG_INPUT);
+        javax.swing.UIManager.put("ComboBox.foreground", TEXT_PRIMARY);
+        javax.swing.UIManager.put("ToolTip.background", BG_CARD);
+        javax.swing.UIManager.put("ToolTip.foreground", TEXT_PRIMARY);
+        javax.swing.UIManager.put("Button.font", FONT_BODY);
+        javax.swing.UIManager.put("Label.font", FONT_BODY);
+    }
 }

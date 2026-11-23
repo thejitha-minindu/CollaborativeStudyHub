@@ -24,15 +24,15 @@ public class ToastNotification extends JPanel {
     private static final long serialVersionUID = 1L;
 
     public enum Type {
-        SUCCESS(ThemeColors.STATUS_ONLINE, "✓"),
-        WARNING(ThemeColors.STATUS_TYPING, "⚠"),
-        ERROR(ThemeColors.STATUS_DANGER, "✖"),
-        INFO(ThemeColors.ACCENT_PRIMARY, "ℹ");
+        SUCCESS(ThemeColors.STATUS_ONLINE, VectorIcon.Kind.CHECK),
+        WARNING(ThemeColors.STATUS_TYPING, VectorIcon.Kind.WARNING),
+        ERROR(ThemeColors.STATUS_DANGER, VectorIcon.Kind.CLOSE),
+        INFO(ThemeColors.ACCENT_PRIMARY, VectorIcon.Kind.INFO);
 
         final Color color;
-        final String icon;
+        final VectorIcon.Kind icon;
 
-        Type(Color color, String icon) {
+        Type(Color color, VectorIcon.Kind icon) {
             this.color = color;
             this.icon = icon;
         }
@@ -46,8 +46,8 @@ public class ToastNotification extends JPanel {
         setOpaque(false);
         setBorder(BorderFactory.createEmptyBorder(10, 14, 10, 16));
 
-        JLabel iconLabel = new JLabel(type.icon);
-        iconLabel.setFont(new Font("Segoe UI", Font.BOLD, 18));
+        JLabel iconLabel = new JLabel(new VectorIcon(type.icon, 20, type.color));
+        iconLabel.setFont(new Font("Dialog", Font.BOLD, 18));
         iconLabel.setForeground(type.color);
 
         JPanel textPanel = new JPanel();

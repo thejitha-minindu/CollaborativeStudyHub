@@ -11,7 +11,7 @@ public final class NetworkConfig {
     // Port Allocations
     public static final int TLS_AUTH_PORT = 9443;
     public static final int NIO_CHAT_PORT = 9000;
-    public static final int FILE_TRANSFER_PORT = 9001;
+    public static final int FILE_TRANSFER_PORT = 9005;
     public static final int UDP_DISCOVERY_PORT = 9876;
     public static final int UDP_PULSE_PORT = 9877;
 

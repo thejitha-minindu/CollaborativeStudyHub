@@ -1,5 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
+cd /d "%~dp0"
 
 set JAVA_CMD=java
 if exist "%JAVA_HOME%\bin\java.exe" (
@@ -10,5 +11,12 @@ if exist "%JAVA_HOME%\bin\java.exe" (
     )
 )
 
-echo Starting Collaborative Study Hub Client GUI...
-"%JAVA_CMD%" -cp out com.studyhub.ui.StudyHubClientMain
+if not exist out\com\studyhub\ui\StudyHubClientMain.class (
+    call build.bat
+    if errorlevel 1 exit /b 1
+)
+
+rem javaw keeps the desktop app independent of a console window.
+set "JAVAW_CMD=javaw"
+if exist "%JAVA_CMD%" for %%J in ("%JAVA_CMD%") do set "JAVAW_CMD=%%~dpJjavaw.exe"
+start "StudyHub" "%JAVAW_CMD%" -cp out com.studyhub.ui.StudyHubClientMain

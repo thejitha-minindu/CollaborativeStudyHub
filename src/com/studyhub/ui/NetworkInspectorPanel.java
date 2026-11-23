@@ -42,6 +42,14 @@ public class NetworkInspectorPanel extends JPanel {
     private final JLabel udpMetricsBadge = createMetricBadge("UDP: Discovery Port 9876 Active");
     private final JLabel httpMetricsBadge = createMetricBadge("Pool: 5 Threads Ready");
 
+    private final javax.swing.JCheckBox tamper = new javax.swing.JCheckBox("Simulate MITM File Tampering");
+    public void onTamperChanged(java.util.function.Consumer<Boolean> callback) {
+        for (java.awt.event.ActionListener l : tamper.getActionListeners()) tamper.removeActionListener(l);
+        tamper.setSelected(false);
+        tamper.addActionListener(e -> callback.accept(tamper.isSelected()));
+    }
+    public void resetTamper() { tamper.setSelected(false); }
+
     public NetworkInspectorPanel() {
         setLayout(new BorderLayout());
         setPreferredSize(new Dimension(850, 240));
@@ -53,11 +61,11 @@ public class NetworkInspectorPanel extends JPanel {
         titleBar.setBackground(ThemeColors.BG_RAIL);
         titleBar.setBorder(BorderFactory.createEmptyBorder(6, 14, 6, 14));
 
-        JLabel titleLbl = new JLabel("⚡ LIVE NETWORK ENGINEERING INSPECTOR & TELEMETRY");
+        JLabel titleLbl = new JLabel("Developer Diagnostics");
         titleLbl.setFont(ThemeColors.FONT_BOLD);
         titleLbl.setForeground(ThemeColors.ACCENT_PRIMARY);
 
-        JLabel hintLbl = new JLabel("Demonstrating 5 Networking Modules (Standard JDK 17+/21 Zero Dependencies)");
+        JLabel hintLbl = new JLabel("Ctrl+Shift+I to close · 5 networking modules");
         hintLbl.setFont(ThemeColors.FONT_MUTED);
         hintLbl.setForeground(ThemeColors.TEXT_MUTED);
 
@@ -73,7 +81,11 @@ public class NetworkInspectorPanel extends JPanel {
 
         tabbedPane.addTab("1. NIO Selector (9000)", createTab(nioMetricsBadge, nioLogArea));
         tabbedPane.addTab("2. TCP FileChannel (9001)", createTab(fileMetricsBadge, fileLogArea));
-        tabbedPane.addTab("3. TLS & Crypto (9443)", createTab(tlsMetricsBadge, tlsLogArea));
+        JPanel cryptoTab = createTab(tlsMetricsBadge, tlsLogArea);
+        tamper.setOpaque(false); tamper.setForeground(ThemeColors.TEXT_MUTED); tamper.setFont(ThemeColors.FONT_BODY);
+        tamper.setToolTipText("Evaluation only: the next upload flips a byte so SHA-256 verification rejects it.");
+        cryptoTab.add(tamper, BorderLayout.SOUTH);
+        tabbedPane.addTab("3. TLS & Crypto (9443)", cryptoTab);
         tabbedPane.addTab("4. UDP Beacons & Pulse (9876/9877)", createTab(udpMetricsBadge, udpLogArea));
         tabbedPane.addTab("5. ThreadPool & HTTP", createTab(httpMetricsBadge, httpLogArea));
 
@@ -133,6 +145,9 @@ public class NetworkInspectorPanel extends JPanel {
                 event.getBufferHexState().isEmpty() ? "" : "(Hex: " + event.getBufferHexState() + ")"
             );
 
+            for (JTextArea area : new JTextArea[]{nioLogArea, fileLogArea, tlsLogArea, udpLogArea, httpLogArea}) {
+                if (area.getDocument().getLength() > 120000) area.replaceRange("", 0, 30000);
+            }
             switch (event.getModule()) {
                 case NIO_SELECTOR:
                     nioLogArea.append(entry);

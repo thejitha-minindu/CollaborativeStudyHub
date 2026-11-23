@@ -55,7 +55,7 @@ public class KeystoreBootstrap {
             "-validity", "365",
             "-storepass", NetworkConfig.KEYSTORE_PASSWORD,
             "-keypass", NetworkConfig.KEYSTORE_PASSWORD,
-            "-dname", "CN=StudyHubServer, OU=NetworkProgramming, O=University, L=Colombo, C=LK"
+            "-dname", "CN=StudyHubServer, O=StudyHub"
         );
 
         pb.redirectErrorStream(true);
@@ -87,20 +87,92 @@ public class KeystoreBootstrap {
         return sslContext;
     }
 
-    /**
-     * Creates a client SSLContext that trusts the studyhub certificate for local lab evaluation.
-     */
+    /** No server keystore or shared truststore is loaded on the client. */
     public static SSLContext createClientSslContext() throws Exception {
-        TrustManager[] trustAll = new TrustManager[] {
-            new X509TrustManager() {
-                public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
-                public void checkClientTrusted(X509Certificate[] certs, String authType) {}
-                public void checkServerTrusted(X509Certificate[] certs, String authType) {}
-            }
-        };
+        return createClientSslContext("default");
+    }
 
-        SSLContext sslContext = SSLContext.getInstance(NetworkConfig.TLS_PROTOCOL);
-        sslContext.init(null, trustAll, new java.security.SecureRandom());
-        return sslContext;
+    /** TOFU: inspect identity and validity, then persist the certificate pin per host + port. */
+    public static SSLContext createClientSslContext(String endpoint) throws Exception {
+        TrustManager[] trust = { new X509TrustManager() {
+            public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
+            public void checkClientTrusted(X509Certificate[] chain, String authType) throws java.security.cert.CertificateException {
+                throw new java.security.cert.CertificateException("Client certificates are not supported");
+            }
+            public void checkServerTrusted(X509Certificate[] chain, String authType) throws java.security.cert.CertificateException {
+                if (chain == null || chain.length == 0) throw new java.security.cert.CertificateException("Missing server certificate");
+                X509Certificate leaf = chain[0];
+                leaf.checkValidity();
+                try {
+                    boolean identity = new javax.naming.ldap.LdapName(leaf.getSubjectX500Principal().getName())
+                        .getRdns().stream().anyMatch(r -> "CN".equalsIgnoreCase(r.getType()) && "StudyHubServer".equals(r.getValue()));
+                    if (!identity) throw new java.security.cert.CertificateException("Expected StudyHubServer certificate identity");
+                    if (chain.length == 1) leaf.verify(leaf.getPublicKey());
+                    else {
+                        for (int i = 0; i < chain.length - 1; i++) {
+                            chain[i + 1].checkValidity();
+                            chain[i].verify(chain[i + 1].getPublicKey());
+                        }
+                    }
+                    rememberCertificate(endpoint, CryptoIntegrityService.computeSha256(leaf.getEncoded()));
+                } catch (java.security.cert.CertificateException e) { throw e; }
+                catch (Exception e) { throw new java.security.cert.CertificateException("Unable to verify workspace certificate: " + e.getMessage(), e); }
+            }
+        }};
+        SSLContext context = SSLContext.getInstance(NetworkConfig.TLS_PROTOCOL);
+        context.init(null, trust, new java.security.SecureRandom());
+        return context;
+    }
+
+    /** Stable workspace encryption key, delivered only after TLS authentication. */
+    public static synchronized String workspaceAesKey() throws Exception {
+        java.nio.file.Path path = java.nio.file.Path.of("certs", "workspace.key");
+        if (java.nio.file.Files.exists(path)) {
+            String key = java.nio.file.Files.readString(path).trim();
+            if (java.util.Base64.getDecoder().decode(key).length != 16) throw new java.io.IOException("Invalid workspace key");
+            return key;
+        }
+        java.nio.file.Files.createDirectories(path.getParent());
+        String key = CryptoIntegrityService.generateAesKeyBase64();
+        java.nio.file.Files.writeString(path, key, java.nio.file.StandardOpenOption.CREATE_NEW);
+        return key;
+    }
+
+    public static java.nio.file.Path knownHostsPath() {
+        return java.nio.file.Path.of(System.getProperty("studyhub.knownHosts",
+            java.nio.file.Path.of(System.getProperty("user.home"), ".studyhub", "known_hosts.properties").toString()));
+    }
+
+    private static synchronized void rememberCertificate(String endpoint, String fingerprint) throws Exception {
+        java.nio.file.Path path = knownHostsPath().toAbsolutePath();
+        java.nio.file.Files.createDirectories(path.getParent());
+        // Coordinate separate client processes as well as threads. Never overwrite another client's pins.
+        try (java.nio.channels.FileChannel channel = java.nio.channels.FileChannel.open(
+                path.resolveSibling(path.getFileName() + ".lock"), java.nio.file.StandardOpenOption.CREATE,
+                java.nio.file.StandardOpenOption.WRITE);
+             java.nio.channels.FileLock lock = channel.lock()) {
+            java.util.Properties pins = new java.util.Properties();
+            if (java.nio.file.Files.exists(path)) {
+                try (InputStream in = java.nio.file.Files.newInputStream(path)) { pins.load(in); }
+            }
+            String previous = pins.getProperty(endpoint);
+            if (previous != null && !previous.equals(fingerprint)) {
+                throw new java.security.cert.CertificateException("Workspace certificate changed for " + endpoint
+                    + ". Compare its fingerprint with the host before removing its saved pin in " + path);
+            }
+            if (previous == null) {
+                pins.setProperty(endpoint, fingerprint);
+                java.nio.file.Path temp = java.nio.file.Files.createTempFile(path.getParent(), "known-hosts-", ".tmp");
+                try {
+                    try (java.io.OutputStream out = java.nio.file.Files.newOutputStream(temp)) {
+                        pins.store(out, "StudyHub TOFU certificate fingerprints (SHA-256)");
+                    }
+                    try { java.nio.file.Files.move(temp, path, java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING); }
+                    catch (java.nio.file.AtomicMoveNotSupportedException e) {
+                        java.nio.file.Files.move(temp, path, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                    }
+                } finally { java.nio.file.Files.deleteIfExists(temp); }
+            }
+        }
     }
 }

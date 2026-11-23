@@ -71,6 +71,7 @@ public class TlsAuthServer {
         SSLServerSocketFactory ssf = sslContext.getServerSocketFactory();
         serverSocket = (SSLServerSocket) ssf.createServerSocket();
         serverSocket.setReuseAddress(true);
+        serverSocket.setEnabledProtocols(new String[]{NetworkConfig.TLS_PROTOCOL});
         serverSocket.bind(new InetSocketAddress(port));
         running = true;
 
@@ -115,6 +116,7 @@ public class TlsAuthServer {
              BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
              PrintWriter writer = new PrintWriter(socket.getOutputStream(), true, StandardCharsets.UTF_8)) {
 
+            socket.setSoTimeout(NetworkConfig.TCP_SOCKET_TIMEOUT_MS);
             socket.startHandshake();
             String cipherSuite = socket.getSession().getCipherSuite();
             String protocol = socket.getSession().getProtocol();
@@ -151,28 +153,22 @@ public class TlsAuthServer {
     // ------------------------------------------------------------------
     // AUTH|<username>|<sha256Password>
     // ------------------------------------------------------------------
-    private void handleAuth(String[] parts, PrintWriter writer) {
+    private void handleAuth(String[] parts, PrintWriter writer) throws Exception {
         String username = parts[1].trim();
         String sha256Password = parts[2].trim();
 
         boolean valid = registry.validateCredentials(username, sha256Password);
-        if (!valid && !registry.hasAccount(username)) {
-            // Demo convenience: unknown classroom accounts are provisioned on first login
-            // and immediately persisted to data/users.db for subsequent restarts.
-            registry.registerAccount(username, sha256Password, ProtocolConstants.ROLE_STUDENT, username);
-            valid = true;
-        }
 
         if (valid) {
             String role = registry.getUserRole(username);
-            String sessionKeyBase64 = CryptoIntegrityService.generateAesKeyBase64();
+            String sessionKeyBase64 = KeystoreBootstrap.workspaceAesKey();
             SafeRoomRegistry.UserSession session = registry.createSession(username, sessionKeyBase64);
 
             String response = ProtocolConstants.RESP_AUTH_OK + ProtocolConstants.DELIMITER +
                 session.getSessionToken() + ProtocolConstants.DELIMITER +
                 role + ProtocolConstants.DELIMITER +
                 sessionKeyBase64 + ProtocolConstants.DELIMITER +
-                registry.getDisplayName(username);
+                DataPersistenceManager.encodeField(registry.getDisplayName(username));
 
             writer.println(response);
 
@@ -180,7 +176,7 @@ public class TlsAuthServer {
                 PacketLogEvent.Module.TLS_SECURITY,
                 PacketLogEvent.Direction.TX,
                 "AUTH_OK Granted",
-                "User: " + username + " (" + role + ") | Token: " + session.getSessionToken()
+                "User: " + username + " (" + role + ")"
             ));
         } else {
             writer.println(ProtocolConstants.RESP_AUTH_FAIL + ProtocolConstants.DELIMITER + "Invalid credentials");

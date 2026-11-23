@@ -376,7 +376,9 @@ public class SafeRoomRegistry {
 
     public int getActiveUserCount() {
         synchronized (stateLock) {
-            return activeSessionsByToken.size();
+            Set<String> online = new HashSet<>();
+            for (Set<String> members : roomMemberships.values()) online.addAll(members);
+            return online.size();
         }
     }
 }

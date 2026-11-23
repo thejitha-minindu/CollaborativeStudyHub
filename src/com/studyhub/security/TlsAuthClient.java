@@ -89,7 +89,8 @@ public class TlsAuthClient {
     private final Consumer<PacketLogEvent> telemetrySink;
 
     public TlsAuthClient(String host, int port, Consumer<PacketLogEvent> telemetrySink) {
-        this.host = host != null ? host : NetworkConfig.DEFAULT_HOST;
+        if (host == null || host.isBlank()) throw new IllegalArgumentException("Select a workspace address first");
+        this.host = host.trim();
         this.port = port > 0 ? port : NetworkConfig.TLS_AUTH_PORT;
         this.telemetrySink = telemetrySink != null ? telemetrySink : e -> {};
     }
@@ -110,10 +111,12 @@ public class TlsAuthClient {
     private AuthResult authenticateWithDigest(String username, String passwordDigest) {
         CertificateDetails certDetails = new CertificateDetails();
         try {
-            SSLContext sslContext = KeystoreBootstrap.createClientSslContext();
+            SSLContext sslContext = KeystoreBootstrap.createClientSslContext(host + ":" + port);
             SSLSocketFactory ssf = sslContext.getSocketFactory();
 
-            try (SSLSocket socket = (SSLSocket) ssf.createSocket(host, port)) {
+            try (SSLSocket socket = (SSLSocket) ssf.createSocket()) {
+                socket.connect(new java.net.InetSocketAddress(host, port), NetworkConfig.TCP_SOCKET_TIMEOUT_MS);
+                socket.setEnabledProtocols(new String[]{NetworkConfig.TLS_PROTOCOL});
                 socket.setSoTimeout(NetworkConfig.TCP_SOCKET_TIMEOUT_MS);
                 socket.startHandshake();
 
@@ -153,7 +156,7 @@ public class TlsAuthClient {
                     PacketLogEvent.Module.TLS_SECURITY,
                     PacketLogEvent.Direction.RX,
                     "Auth Response Received",
-                    response
+                    "Server replied: " + response.split("\\|", 2)[0]
                 ));
 
                 String[] parts = response.split(ProtocolConstants.DELIMITER_REGEX, -1);
@@ -192,10 +195,12 @@ public class TlsAuthClient {
     private RegisterResult registerWithDigest(String username, String passwordDigest, String displayName) {
         CertificateDetails certDetails = new CertificateDetails();
         try {
-            SSLContext sslContext = KeystoreBootstrap.createClientSslContext();
+            SSLContext sslContext = KeystoreBootstrap.createClientSslContext(host + ":" + port);
             SSLSocketFactory ssf = sslContext.getSocketFactory();
 
-            try (SSLSocket socket = (SSLSocket) ssf.createSocket(host, port)) {
+            try (SSLSocket socket = (SSLSocket) ssf.createSocket()) {
+                socket.connect(new java.net.InetSocketAddress(host, port), NetworkConfig.TCP_SOCKET_TIMEOUT_MS);
+                socket.setEnabledProtocols(new String[]{NetworkConfig.TLS_PROTOCOL});
                 socket.setSoTimeout(NetworkConfig.TCP_SOCKET_TIMEOUT_MS);
                 socket.startHandshake();
 
@@ -238,7 +243,7 @@ public class TlsAuthClient {
                     PacketLogEvent.Module.TLS_SECURITY,
                     PacketLogEvent.Direction.RX,
                     "Register Response Received",
-                    response
+                    "Server replied: " + response.split("\\|", 2)[0]
                 ));
 
                 String[] parts = response.split(ProtocolConstants.DELIMITER_REGEX, -1);

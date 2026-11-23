@@ -33,6 +33,7 @@ import java.util.concurrent.Future;
  */
 public class VerifyIntegrationTest {
 
+    private static final String TEST_HOST = com.studyhub.common.LanAddresses.preferredAddress();
     private static int passedChecks = 0;
     private static int totalChecks = 0;
 
@@ -51,6 +52,8 @@ public class VerifyIntegrationTest {
         System.out.println("       RUNNING COLLABORATIVE STUDY HUB INTEGRATION TEST SUITE         ");
         System.out.println("======================================================================");
 
+        if (System.getProperty("studyhub.knownHosts") == null) System.setProperty("studyhub.knownHosts",
+            Path.of("build", "verification-known-hosts.properties").toString());
         StudyHubServerMain server = new StudyHubServerMain();
         try {
             // 1. Launch Server
@@ -85,6 +88,8 @@ public class VerifyIntegrationTest {
             // 8. Test Disk Persistence: registration, rooms, history replay, vault index
             System.out.println("\n[PHASE 8] Testing Disk Persistence Engine (data/users.db, rooms.db, history_*, vault_index.db)...");
             testPersistenceRegistrationRoomsHistory(uploadedFileName);
+            System.out.println("\n[PHASE 9] LAN routing, isolated client TLS, TOFU pinning, multi-user encryption, large frames...");
+            testLanReliability();
 
             System.out.println("\n======================================================================");
             System.out.println("   >>> ALL 5 NETWORKING MODULE TESTS PASSED WITH 100% SUCCESS! <<<    ");
@@ -117,15 +122,158 @@ public class VerifyIntegrationTest {
 
             assertTrue(raw.startsWith("BEACON"), "Packet starts with BEACON header");
             String[] parts = raw.split("\\|");
-            assertTrue(parts.length >= 8, "Beacon contains all 8 protocol fields");
+            assertTrue(parts.length >= 9, "Beacon contains ports, users and advertised IPv4");
+            String advertised = parts[8];
+            assertTrue(advertised.equals(TEST_HOST) || com.studyhub.common.LanAddresses.active().stream()
+                .anyMatch(a -> a.address().getHostAddress().equals(advertised)), "Beacon announces an active IPv4 address");
+            if (!com.studyhub.common.LanAddresses.active().isEmpty()) {
+                assertTrue(!java.net.InetAddress.getByName(advertised).isLoopbackAddress(), "Non-loopback IPv4 advertised when available");
+            }
             assertTrue(Integer.parseInt(parts[3]) == NetworkConfig.TLS_AUTH_PORT, "Beacon announces TLS port 9443");
             assertTrue(Integer.parseInt(parts[4]) == NetworkConfig.NIO_CHAT_PORT, "Beacon announces NIO port 9000");
             assertTrue(Integer.parseInt(parts[5]) == NetworkConfig.FILE_TRANSFER_PORT, "Beacon announces FileTransfer port 9001");
         }
     }
 
+    private static void testLanReliability() throws Exception {
+        Path isolated = Files.createTempDirectory(Path.of("build"), "client-isolation-").toAbsolutePath();
+        String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        String classpath = Path.of("out").toAbsolutePath().toString();
+        Process child = new ProcessBuilder(javaExecutable, "-cp", classpath, "com.studyhub.test.IsolatedClientProbe", TEST_HOST)
+            .directory(isolated.toFile()).redirectErrorStream(true).redirectOutput(isolated.resolve("probe.log").toFile()).start();
+        boolean finished = child.waitFor(25, java.util.concurrent.TimeUnit.SECONDS);
+        if (!finished) child.destroyForcibly();
+        assertTrue(finished && child.exitValue() == 0, "Fresh client with no certs/truststore authenticates over LAN: " + Files.readString(isolated.resolve("probe.log")));
+        assertTrue(!Files.exists(isolated.resolve("certs")), "Client never bootstraps a server keystore");
+
+        TlsAuthClient.AuthResult one = new TlsAuthClient(TEST_HOST, NetworkConfig.TLS_AUTH_PORT, null).authenticate("student2", "pass123");
+        TlsAuthClient.AuthResult two = new TlsAuthClient(TEST_HOST, NetworkConfig.TLS_AUTH_PORT, null).authenticate("student3", "pass123");
+        assertTrue(one.success && two.success, "Two distinct accounts authenticate through selected LAN address");
+        String encrypted = CryptoIntegrityService.encryptAes("Readable on the second laptop", one.aesKeyBase64);
+        assertTrue("Readable on the second laptop".equals(CryptoIntegrityService.decryptAes(encrypted, two.aesKeyBase64)), "Different members can decrypt shared workspace messages");
+        assertTrue(one.aesKeyBase64.equals(com.studyhub.security.KeystoreBootstrap.workspaceAesKey()), "Workspace encryption key survives sign-ins");
+
+        Path pins = com.studyhub.security.KeystoreBootstrap.knownHostsPath();
+        java.util.Properties saved = new java.util.Properties();
+        try (java.io.InputStream in = Files.newInputStream(pins)) { saved.load(in); }
+        assertTrue(one.certificateDetails.sha256Fingerprint.equals(saved.getProperty(TEST_HOST + ":9443")), "Actual server fingerprint saved by endpoint");
+        java.util.Properties changed = new java.util.Properties(); changed.putAll(saved);
+        changed.setProperty(TEST_HOST + ":9443", "0".repeat(64));
+        try {
+            try (java.io.OutputStream out = Files.newOutputStream(pins)) { changed.store(out, "Pin mismatch regression"); }
+            TlsAuthClient.AuthResult rejected = new TlsAuthClient(TEST_HOST, NetworkConfig.TLS_AUTH_PORT, null).authenticate("student2", "pass123");
+            assertTrue(!rejected.success && rejected.errorMessage.contains("certificate changed"), "Changed certificate pin rejected before credentials are sent");
+        } finally { try (java.io.OutputStream out = Files.newOutputStream(pins)) { saved.store(out, "Restored pins"); } }
+
+        // A single fragmented frame larger than the initial accumulator used to freeze history replay.
+        String large = "history-entry ".repeat(3000);
+        ByteBuffer framed = new MessageFramer().frameMessage(large);
+        ByteBuffer accumulator = ByteBuffer.allocate(NetworkConfig.NIO_BUFFER_CAPACITY);
+        MessageFramer decoder = new MessageFramer(); List<String> decoded = new ArrayList<>();
+        while (framed.hasRemaining()) {
+            accumulator = MessageFramer.ensureWritable(accumulator);
+            int length = Math.min(Math.min(framed.remaining(), accumulator.remaining()), 607);
+            byte[] fragment = new byte[length]; framed.get(fragment); accumulator.put(fragment);
+            decoded.addAll(decoder.extractFrames(accumulator));
+        }
+        assertTrue(decoded.size() == 1 && decoded.get(0).equals(large), "Fragmented 42KB history frame decoded without truncation or stall");
+
+        java.util.concurrent.CopyOnWriteArrayList<com.studyhub.common.PacketLogEvent> events = new java.util.concurrent.CopyOnWriteArrayList<>();
+        com.studyhub.concurrent.SafeRoomRegistry registry = new com.studyhub.concurrent.SafeRoomRegistry();
+        com.studyhub.concurrent.SafeRoomRegistry.UserSession local = registry.createSession("student1", one.aesKeyBase64);
+        com.studyhub.udp.PresencePulseService pulse = new com.studyhub.udp.PresencePulseService(registry, null, events::add);
+        pulse.handleIncomingPulse("PULSE|100|student1|#general|TYPING");
+        pulse.handleIncomingPulse("PULSE|50|student1|#general|ONLINE");
+        assertTrue("TYPING".equals(local.getPresenceStatus()), "Stale UDP pulse cannot overwrite typing state");
+        registry.createSession("student1", one.aesKeyBase64);
+        pulse.handleIncomingPulse("PULSE|1|student1|#general|FOCUS");
+        assertTrue("FOCUS".equals(registry.getSessionByUsername("student1").getPresenceStatus()), "Pulse sequence restarts correctly after a new sign-in");
+        testDiscoverySenderAndDedup();
+        TofuSecurityTest.run();
+        assertTrue(true, "Wrong-identity and expired X.509 certificates rejected");
+        testTwoMemberCollaboration(one, two);
+    }
+
+    private static void testTwoMemberCollaboration(TlsAuthClient.AuthResult one, TlsAuthClient.AuthResult two) throws Exception {
+        try (Peer first = new Peer(); Peer second = new Peer()) {
+            first.send("HELLO|" + one.sessionToken + "|student2");
+            second.send("HELLO|" + two.sessionToken + "|student3");
+            second.await(f -> f.startsWith("USER_LIST|#general|") && f.contains("student2:"));
+            String text = "Shared over LAN " + System.nanoTime();
+            String encrypted = CryptoIntegrityService.encryptAes(text, one.aesKeyBase64);
+            first.send("MSG|#general|AES|" + encrypted + "|");
+            String delivered = second.await(f -> f.startsWith("CHAT|#general|student2|AES|") && f.contains(encrypted));
+            assertTrue(text.equals(CryptoIntegrityService.decryptAes(delivered.split("\\|", -1)[4], two.aesKeyBase64)), "Encrypted NIO chat delivered to a second signed-in member");
+            PresencePulseService.sendClientPulse(TEST_HOST, NetworkConfig.UDP_PULSE_PORT, 1000, "student2", "#general", "TYPING");
+            assertTrue(second.await(f -> f.equals("PRESENCE_UPDATE|#general|student2|TYPING")) != null, "Remote UDP typing pulse reaches another member through NIO");
+            PresencePulseService.sendClientPulse(TEST_HOST, NetworkConfig.UDP_PULSE_PORT, 999, "student2", "#general", "ONLINE");
+            PresencePulseService.sendClientPulse(TEST_HOST, NetworkConfig.UDP_PULSE_PORT, 1001, "student2", "#general", "FOCUS");
+            assertTrue(second.await(f -> f.startsWith("PRESENCE_UPDATE|")).endsWith("|FOCUS"), "Stale pulse is discarded on the live server");
+            String original = DataPersistenceManager.getInstance().getDisplayName("student2");
+            String updated = "LAN Member " + System.nanoTime();
+            first.send("UPDATE_PROFILE|" + DataPersistenceManager.encodeField(updated));
+            assertTrue(first.await(f -> f.startsWith("PROFILE_UPDATED|")).equals("PROFILE_UPDATED|" + DataPersistenceManager.encodeField(updated)), "Profile save acknowledged by the remote server");
+            assertTrue(second.await(f -> f.startsWith("USER_LIST|") && f.contains(java.util.Base64.getEncoder().encodeToString(updated.getBytes(StandardCharsets.UTF_8)))) != null, "Display name update reaches the other laptop roster");
+            assertTrue(updated.equals(DataPersistenceManager.getInstance().getDisplayName("student2")), "Display name saved in host persistence");
+            first.send("UPDATE_PROFILE|" + DataPersistenceManager.encodeField(original));
+            first.await(f -> f.startsWith("PROFILE_UPDATED|"));
+            // Large data frame traverses a live Selector and returns intact (not only a framer unit check).
+            String large = CryptoIntegrityService.encryptAes("Live large message ".repeat(1600), one.aesKeyBase64);
+            first.send("MSG|#general|AES|" + large + "|");
+            String received = second.await(f -> f.startsWith("CHAT|#general|student2|AES|") && f.contains(large));
+            assertTrue(received.contains(large), "Live NIO frame larger than 8KB reaches the second member intact");
+            byte[] changed = java.util.Base64.getDecoder().decode(large.substring(4)); changed[changed.length - 1] ^= 1;
+            boolean rejected = false;
+            try { CryptoIntegrityService.decryptAes("gcm:" + java.util.Base64.getEncoder().encodeToString(changed), two.aesKeyBase64); }
+            catch (javax.crypto.AEADBadTagException expected) { rejected = true; }
+            assertTrue(rejected, "Modified encrypted messages fail GCM authentication");
+        }
+    }
+
+    private static final class Peer implements AutoCloseable {
+        private final java.net.Socket socket = new java.net.Socket();
+        private final java.io.DataInputStream input;
+        private final java.io.DataOutputStream output;
+        Peer() throws Exception {
+            socket.connect(new InetSocketAddress(TEST_HOST, NetworkConfig.NIO_CHAT_PORT), 5000);
+            socket.setSoTimeout(5000); input = new java.io.DataInputStream(socket.getInputStream());
+            output = new java.io.DataOutputStream(socket.getOutputStream());
+        }
+        void send(String payload) throws Exception {
+            byte[] bytes = payload.getBytes(StandardCharsets.UTF_8); output.writeInt(bytes.length); output.write(bytes); output.flush();
+        }
+        String await(java.util.function.Predicate<String> predicate) throws Exception {
+            long deadline = System.currentTimeMillis() + 7000;
+            while (System.currentTimeMillis() < deadline) {
+                int size = input.readInt();
+                if (size < 0 || size > 10 * 1024 * 1024) throw new AssertionError("Invalid frame");
+                byte[] data = new byte[size]; input.readFully(data); String frame = new String(data, StandardCharsets.UTF_8);
+                if (predicate.test(frame)) return frame;
+            }
+            throw new AssertionError("Expected collaboration event was not delivered");
+        }
+        public void close() throws java.io.IOException { socket.close(); }
+    }
+
+    private static void testDiscoverySenderAndDedup() throws Exception {
+        com.studyhub.udp.LanDiscoveryListener listener = new com.studyhub.udp.LanDiscoveryListener(null, null);
+        listener.start();
+        try (DatagramSocket sender = new DatagramSocket(new InetSocketAddress(TEST_HOST, 0))) {
+            sender.setBroadcast(true);
+            for (String name : new String[]{"X", "Discovery regression workspace", "Discovery regression workspace"}) {
+                String beacon = "BEACON|1|" + name + "|9443|9000|9001|9877|2|" + (TEST_HOST.startsWith("127.") ? TEST_HOST : "127.0.0.9");
+                byte[] data = beacon.getBytes(StandardCharsets.UTF_8);
+                sender.send(new DatagramPacket(data, data.length, java.net.InetAddress.getByName(TEST_HOST), 9876));
+            }
+            long deadline = System.currentTimeMillis() + 3000;
+            while (listener.getDiscoveredHubs().stream().noneMatch(h -> h.hubName.equals("Discovery regression workspace")) && System.currentTimeMillis() < deadline) Thread.sleep(20);
+            long matches = listener.getDiscoveredHubs().stream().filter(h -> h.hubName.equals("Discovery regression workspace") && h.hostAddress.equals(TEST_HOST)).count();
+            assertTrue(matches == 1, "Discovery uses actual sender IP, resets datagram capacity and deduplicates IP + hub name");
+        } finally { listener.stop(); }
+    }
+
     private static TlsAuthClient.AuthResult testTlsAuth() throws Exception {
-        TlsAuthClient authClient = new TlsAuthClient(NetworkConfig.DEFAULT_HOST, NetworkConfig.TLS_AUTH_PORT, null);
+        TlsAuthClient authClient = new TlsAuthClient(TEST_HOST, NetworkConfig.TLS_AUTH_PORT, null);
         TlsAuthClient.AuthResult result = authClient.authenticate("student1", "pass123");
 
         assertTrue(result.success, "TLS Authentication succeeded for 'student1'");
@@ -143,55 +291,22 @@ public class VerifyIntegrationTest {
         String sampleMessage = "Confidential Study Group Notes 12345";
         String ciphertext = CryptoIntegrityService.encryptAes(sampleMessage, result.aesKeyBase64);
         String decrypted = CryptoIntegrityService.decryptAes(ciphertext, result.aesKeyBase64);
-        assertTrue(sampleMessage.equals(decrypted), "AES-128-CBC encryption and decryption roundtrip match!");
+        assertTrue(sampleMessage.equals(decrypted), "AES-128-GCM encryption and decryption roundtrip match!");
 
         return result;
     }
 
     private static void testNioMultiplexing(TlsAuthClient.AuthResult auth) throws Exception {
-        MessageFramer framer = new MessageFramer();
-        try (SocketChannel channel = SocketChannel.open()) {
-            channel.connect(new InetSocketAddress(NetworkConfig.DEFAULT_HOST, NetworkConfig.NIO_CHAT_PORT));
-            channel.configureBlocking(true);
-
-            // Send HELLO
-            String helloMsg = ProtocolConstants.CMD_HELLO + "|" + auth.sessionToken + "|student1";
-            channel.write(framer.frameMessage(helloMsg));
-
-            ByteBuffer readBuf = ByteBuffer.allocate(4096);
-            channel.read(readBuf);
-            List<String> frames = framer.extractFrames(readBuf);
-            assertTrue(!frames.isEmpty(), "Received greeting frames from NIO Selector");
-
-            // Send JOIN
-            String joinMsg = ProtocolConstants.CMD_JOIN + "|#network-programming";
-            channel.write(framer.frameMessage(joinMsg));
-            readBuf.clear();
-            channel.read(readBuf);
-            frames = framer.extractFrames(readBuf);
-            assertTrue(!frames.isEmpty(), "Received room confirmation from NIO Selector");
-
-            // Send MSG
-            String chatMsg = ProtocolConstants.CMD_MSG + "|#network-programming|PLAIN|Hello NIO Non-Blocking World!|";
-            channel.write(framer.frameMessage(chatMsg));
-
-            boolean foundChat = false;
-            long deadline = System.currentTimeMillis() + 4000;
-            while (!foundChat && System.currentTimeMillis() < deadline) {
-                if (channel.read(readBuf) > 0) {
-                    List<String> newFrames = framer.extractFrames(readBuf);
-                    for (String f : newFrames) {
-                        if (f.contains("Hello NIO Non-Blocking World!")) {
-                            foundChat = true;
-                            break;
-                        }
-                    }
-                }
-                if (!foundChat) {
-                    Thread.sleep(50);
-                }
-            }
-            assertTrue(foundChat, "Echoed chat frame received over NIO SocketChannel");
+        try (Peer peer = new Peer()) {
+            peer.send(ProtocolConstants.CMD_HELLO + "|" + auth.sessionToken + "|student1");
+            assertTrue(peer.await(f -> f.startsWith("SYSTEM|Welcome")) != null, "Received greeting frames from NIO Selector");
+            peer.send(ProtocolConstants.CMD_JOIN + "|#network-programming");
+            assertTrue(peer.await(f -> f.startsWith("SYSTEM|Joined room #network-programming")) != null,
+                "Received room confirmation from NIO Selector");
+            String text = "Hello NIO Non-Blocking World! " + System.nanoTime();
+            peer.send(ProtocolConstants.CMD_MSG + "|#network-programming|PLAIN|" + text + "|");
+            assertTrue(peer.await(f -> f.startsWith("CHAT|#network-programming|student1|PLAIN|") && f.contains(text)) != null,
+                "Echoed chat frame received over NIO SocketChannel");
         }
     }
 
@@ -203,7 +318,7 @@ public class VerifyIntegrationTest {
             fos.write("%PDF-1.4\n1 0 obj\n<< /Title (Networking Notes) >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF".getBytes(StandardCharsets.UTF_8));
         }
 
-        FileTransferClient client = new FileTransferClient(NetworkConfig.DEFAULT_HOST, NetworkConfig.FILE_TRANSFER_PORT, auth.sessionToken, null);
+        FileTransferClient client = new FileTransferClient(TEST_HOST, NetworkConfig.FILE_TRANSFER_PORT, auth.sessionToken, null);
 
         final long[] progressTicks = new long[1];
         FileTransferClient.ProgressListener progress = (transferred, total) -> progressTicks[0]++;
@@ -280,15 +395,15 @@ public class VerifyIntegrationTest {
 
     private static void testUdpPulseSequencing() throws Exception {
         // Send valid in-order pulse
-        PresencePulseService.sendClientPulse(NetworkConfig.DEFAULT_HOST, NetworkConfig.UDP_PULSE_PORT, 100, "student1", "#network-programming", "TYPING");
+        PresencePulseService.sendClientPulse(TEST_HOST, NetworkConfig.UDP_PULSE_PORT, 100, "student1", "#network-programming", "TYPING");
         Thread.sleep(100);
 
         // Send stale out-of-order pulse (seq 50 < 100)
-        PresencePulseService.sendClientPulse(NetworkConfig.DEFAULT_HOST, NetworkConfig.UDP_PULSE_PORT, 50, "student1", "#network-programming", "ONLINE");
+        PresencePulseService.sendClientPulse(TEST_HOST, NetworkConfig.UDP_PULSE_PORT, 50, "student1", "#network-programming", "ONLINE");
         Thread.sleep(100);
 
         // Send a real-world study status pulse (Available / Focusing / In Lab)
-        PresencePulseService.sendClientPulse(NetworkConfig.DEFAULT_HOST, NetworkConfig.UDP_PULSE_PORT, 101, "student1", "#network-programming", ProtocolConstants.STATUS_FOCUS);
+        PresencePulseService.sendClientPulse(TEST_HOST, NetworkConfig.UDP_PULSE_PORT, 101, "student1", "#network-programming", ProtocolConstants.STATUS_FOCUS);
         Thread.sleep(100);
 
         assertTrue(true, "UDP Pulses processed and out-of-order sequencing verified without errors");
@@ -313,7 +428,7 @@ public class VerifyIntegrationTest {
         String password = "StudyHub2024!";
         String displayName = "Verification Student";
 
-        TlsAuthClient regClient = new TlsAuthClient(NetworkConfig.DEFAULT_HOST, NetworkConfig.TLS_AUTH_PORT, null);
+        TlsAuthClient regClient = new TlsAuthClient(TEST_HOST, NetworkConfig.TLS_AUTH_PORT, null);
 
         TlsAuthClient.RegisterResult registration = regClient.register(username, password, displayName);
         assertTrue(registration.success, "REGISTER accepted new student '" + username + "' over TLSv1.3");
@@ -403,7 +518,7 @@ public class VerifyIntegrationTest {
                 assertTrue(denial != null, "Student pin attempt rejected (moderator-only action)");
             }
 
-            TlsAuthClient.AuthResult adminAuth = new TlsAuthClient(NetworkConfig.DEFAULT_HOST, NetworkConfig.TLS_AUTH_PORT, null)
+            TlsAuthClient.AuthResult adminAuth = new TlsAuthClient(TEST_HOST, NetworkConfig.TLS_AUTH_PORT, null)
                 .authenticate("admin", "admin123");
             assertTrue(adminAuth.success, "Moderator 'admin' authenticated for the pinning test");
 
@@ -470,13 +585,13 @@ public class VerifyIntegrationTest {
     private static final class NioProbe implements AutoCloseable {
         private final SocketChannel channel;
         private final MessageFramer framer = new MessageFramer();
-        private final ByteBuffer buffer = ByteBuffer.allocate(NetworkConfig.NIO_BUFFER_CAPACITY);
+        private ByteBuffer buffer = ByteBuffer.allocate(NetworkConfig.NIO_BUFFER_CAPACITY);
         private final List<String> frames = new ArrayList<>();
 
         NioProbe(String sessionToken, String username) throws Exception {
             channel = SocketChannel.open();
             channel.configureBlocking(false);
-            channel.connect(new InetSocketAddress(NetworkConfig.DEFAULT_HOST, NetworkConfig.NIO_CHAT_PORT));
+            channel.connect(new InetSocketAddress(TEST_HOST, NetworkConfig.NIO_CHAT_PORT));
 
             long deadline = System.currentTimeMillis() + 5000;
             while (!channel.finishConnect() && System.currentTimeMillis() < deadline) {
@@ -504,6 +619,7 @@ public class VerifyIntegrationTest {
                 String hit = scan(prefix, needle);
                 if (hit != null) return hit;
 
+                buffer = MessageFramer.ensureWritable(buffer);
                 int read = channel.read(buffer);
                 if (read > 0) {
                     frames.addAll(framer.extractFrames(buffer));

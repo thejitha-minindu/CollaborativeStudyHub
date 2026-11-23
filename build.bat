@@ -1,5 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
+cd /d "%~dp0"
 
 echo ===================================================
 echo   Compiling Collaborative Study Hub (Java SE 17+)   
@@ -16,7 +17,7 @@ if exist "%JAVA_HOME%\bin\javac.exe" (
 
 if not exist out mkdir out
 dir /s /b src\*.java > sources.txt
-"%JAVAC_CMD%" -encoding UTF-8 -d out @sources.txt
+"%JAVAC_CMD%" --release 17 -encoding UTF-8 -d out @sources.txt
 set COMPILE_STATUS=%ERRORLEVEL%
 del sources.txt
 

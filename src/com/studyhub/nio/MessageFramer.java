@@ -61,8 +61,7 @@ public class MessageFramer {
 
             if (frameLen < 0 || frameLen > 10 * 1024 * 1024) {
                 // Safeguard against stream corruption or protocol desync
-                readBuffer.clear();
-                break;
+                throw new IllegalArgumentException("Invalid frame length: " + frameLen);
             }
 
             if (readBuffer.remaining() >= frameLen) {
@@ -86,6 +85,13 @@ public class MessageFramer {
         lastCapacity = readBuffer.capacity();
 
         return frames;
+    }
+
+    public static ByteBuffer ensureWritable(ByteBuffer buffer) {
+        if (buffer.hasRemaining()) return buffer;
+        if (buffer.capacity() >= 10 * 1024 * 1024 + 4) throw new IllegalArgumentException("Frame exceeds 10MB limit");
+        ByteBuffer grown = ByteBuffer.allocate(Math.min(buffer.capacity() * 2, 10 * 1024 * 1024 + 4));
+        buffer.flip(); grown.put(buffer); return grown;
     }
 
     public long getTotalFramesRead() {

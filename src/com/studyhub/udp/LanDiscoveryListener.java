@@ -65,6 +65,7 @@ public class LanDiscoveryListener {
         try {
             socket = new DatagramSocket(null);
             socket.setReuseAddress(true);
+            socket.setBroadcast(true);
             socket.bind(new InetSocketAddress(NetworkConfig.UDP_DISCOVERY_PORT));
             socket.setSoTimeout(NetworkConfig.UDP_DISCOVERY_TIMEOUT_MS);
             running = true;
@@ -81,6 +82,7 @@ public class LanDiscoveryListener {
             ));
 
         } catch (Exception e) {
+            if (socket != null) socket.close();
             telemetrySink.accept(new PacketLogEvent(
                 PacketLogEvent.Module.UDP_BEACON,
                 PacketLogEvent.Direction.INTERNAL,
@@ -96,7 +98,9 @@ public class LanDiscoveryListener {
 
         while (running && socket != null && !socket.isClosed()) {
             try {
+                packet.setLength(buffer.length);
                 socket.receive(packet);
+                purgeStaleHubs();
                 String raw = new String(packet.getData(), packet.getOffset(), packet.getLength(), StandardCharsets.UTF_8);
                 String senderIp = packet.getAddress().getHostAddress();
 
@@ -143,7 +147,15 @@ public class LanDiscoveryListener {
                 int pulsePort = Integer.parseInt(parts[6]);
                 int activeUsers = Integer.parseInt(parts[7]);
 
-                String key = senderIp + ":" + tlsPort;
+                if (hubName.isBlank() || hubName.length() > 80 || activeUsers < 0
+                    || tlsPort != NetworkConfig.TLS_AUTH_PORT || nioPort != NetworkConfig.NIO_CHAT_PORT
+                    || filePort != NetworkConfig.FILE_TRANSFER_PORT || pulsePort != NetworkConfig.UDP_PULSE_PORT) return;
+                // Trust the actual packet source. A local loopback beacon carries the host's LAN address.
+                if ((senderIp.startsWith("127.") || senderIp.equals("0.0.0.0")) && parts.length >= 9
+                    && parts[8].matches("(?:[0-9]{1,3}\\.){3}[0-9]{1,3}")) {
+                    senderIp = parts[8];
+                }
+                String key = senderIp + ":" + hubName;
                 DiscoveredHub hub = new DiscoveredHub(hubName, senderIp, tlsPort, nioPort, filePort, pulsePort, activeUsers);
                 hubsByKey.put(key, hub);
 

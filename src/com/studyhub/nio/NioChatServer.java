@@ -184,7 +184,7 @@ public class NioChatServer {
                     framer.getBufferInspectionSummary()
                 ));
             }
-        } catch (IOException e) {
+        } catch (IOException | IllegalArgumentException e) {
             disconnectClient(key, ctx);
         }
     }
@@ -207,7 +207,7 @@ public class NioChatServer {
             // All queued buffers sent; clear OP_WRITE interest to avoid busy-spin
             key.interestOps(key.interestOps() & ~SelectionKey.OP_WRITE);
 
-        } catch (IOException e) {
+        } catch (IOException | IllegalArgumentException e) {
             disconnectClient(key, ctx);
         }
     }
@@ -232,7 +232,10 @@ public class NioChatServer {
                         ctx.setAuthenticated(true);
                         ctx.setRole(session.getRole());
 
-                        contextsByUsername.put(session.getUsername().toLowerCase(), ctx);
+                        ClientChannelContext previous = contextsByUsername.put(session.getUsername().toLowerCase(), ctx);
+                        if (previous != null && previous != ctx) {
+                            disconnectClient(previous.getChannel().keyFor(selector), previous);
+                        }
 
                         sendDirectMessage(ctx, ProtocolConstants.EVT_SYSTEM + ProtocolConstants.DELIMITER +
                             "Welcome back to StudyHub, " + session.getDisplayName() + "! Role: " + session.getRole());
@@ -247,6 +250,18 @@ public class NioChatServer {
                         broadcastUserList(session.getCurrentRoom());
                     } else {
                         sendDirectMessage(ctx, ProtocolConstants.EVT_SYSTEM + ProtocolConstants.DELIMITER + "Auth failed or token expired.");
+                    }
+                }
+                break;
+
+            case "UPDATE_PROFILE":
+                if (ctx.isAuthenticated() && parts.length >= 2) {
+                    String name = DataPersistenceManager.decodeField(parts[1]).trim();
+                    if (!name.isEmpty() && name.length() <= 48 && registry.updateProfile(ctx.getUsername(), name, null)) {
+                        SafeRoomRegistry.UserSession profile = registry.getSessionByToken(ctx.getSessionToken());
+                        if (profile != null) profile.setDisplayName(name);
+                        sendDirectMessage(ctx, "PROFILE_UPDATED|" + DataPersistenceManager.encodeField(name));
+                        broadcastUserList(ctx.getCurrentRoom());
                     }
                 }
                 break;
@@ -358,7 +373,7 @@ public class NioChatServer {
                             String url = matcher.group();
                             concurrentEngine.execute(() -> {
                                 try {
-                                    com.studyhub.concurrent.LinkPreview preview = concurrentEngine.submitLinkPreview(url).get();
+                                    com.studyhub.concurrent.LinkPreview preview = new com.studyhub.concurrent.LinkPreviewCallable(url).call();
                                     String linkPayload = ProtocolConstants.EVT_LINK_CARD + ProtocolConstants.DELIMITER +
                                         room + ProtocolConstants.DELIMITER +
                                         preview.getRawUrl() + ProtocolConstants.DELIMITER +
@@ -511,7 +526,10 @@ public class NioChatServer {
         for (String m : members) {
             SafeRoomRegistry.UserSession s = registry.getSessionByUsername(m);
             String status = (s != null) ? s.getPresenceStatus() : ProtocolConstants.STATUS_ONLINE;
-            sb.append(ProtocolConstants.DELIMITER).append(m).append(":").append(status);
+            sb.append(ProtocolConstants.DELIMITER).append(m).append(":").append(status)
+                .append(":").append(s != null ? s.getRole() : ProtocolConstants.ROLE_STUDENT)
+                .append(":").append(java.util.Base64.getEncoder().encodeToString(
+                    registry.getDisplayName(m).getBytes(java.nio.charset.StandardCharsets.UTF_8)));
         }
         broadcastToRoom(room, sb.toString());
     }
@@ -569,11 +587,10 @@ public class NioChatServer {
 
         allContexts.remove(ctx);
         if (ctx.getUsername() != null) {
-            contextsByUsername.remove(ctx.getUsername().toLowerCase());
-            String room = ctx.getCurrentRoom();
-            registry.removeUserFromAllRooms(ctx.getUsername());
-            if (room != null) {
-                broadcastUserList(room);
+            if (contextsByUsername.remove(ctx.getUsername().toLowerCase(), ctx)) {
+                String room = ctx.getCurrentRoom();
+                registry.removeUserFromAllRooms(ctx.getUsername());
+                if (room != null) broadcastUserList(room);
             }
         }
 
